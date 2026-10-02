@@ -129,8 +129,8 @@ class Journal:
         if permission.evidence_class not in {"native_response", "synthetic_fixture"}:
             raise AcquisitionFailure("original_bytes_evidence_class_required")
         with self.connect() as connection:
-            # The stop commit and physical transport invocation share this lock.
-            # An in-flight send finishes before a concurrent stop can commit.
+            # Commit admission before dispatch. A process death cannot erase
+            # the attempt and cause replay to silently send it again.
             connection.execute("BEGIN IMMEDIATE")
             state = connection.execute("SELECT * FROM route_state WHERE scope=?", (scope,)).fetchone()
             if not state or state["stopped"] or state["generation"] != generation:
@@ -140,25 +140,38 @@ class Journal:
                 if existing["scope"] != scope or existing["generation"] != generation:
                     raise AcquisitionFailure("attempt_identity_conflict")
                 return True
+            connection.execute("INSERT INTO responses VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, 'dispatch_unknown')", (
+                attempt_id, scope, generation, permission.evidence_class, expires,
+            ))
+        with self.connect() as connection:
+            # Recheck after admission, at physical dispatch. An in-flight send
+            # finishes before a concurrent stop can commit. Only the caller
+            # that inserted the admission may invoke the transport.
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute("SELECT * FROM route_state WHERE scope=?", (scope,)).fetchone()
+            if not state or state["stopped"] or state["generation"] != generation:
+                raise AcquisitionFailure("dispatch_fenced")
             try:
                 response = send()
             except Exception:
                 # Persist that this attempt actually dispatched. Reusing the
                 # same attempt must never silently send again after a timeout.
-                connection.execute("INSERT INTO responses VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, 'transport_failure')", (
-                    attempt_id, scope, generation, permission.evidence_class, expires,
-                ))
+                connection.execute("UPDATE responses SET outcome='transport_failure' WHERE attempt_id=?", (attempt_id,))
                 return False
-            if not isinstance(response, SourceResponse) or not isinstance(response.body, bytes) or len(response.body) > 8_000_000:
-                raise AcquisitionFailure("invalid_or_oversize_response")
-            captured = _time(response.captured_at)
-            if type(response.status) is not int or not (100 <= response.status <= 599 or response.status == 999):
-                raise AcquisitionFailure("invalid_response_status")
-            if not isinstance(response.content_type, str) or len(response.content_type) > 200:
-                raise AcquisitionFailure("invalid_content_type")
-            connection.execute("INSERT INTO responses VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured')", (
-                attempt_id, scope, generation, response.status, response.content_type,
-                captured, permission.evidence_class, hashlib.sha256(response.body).hexdigest(), expires, response.body,
+            try:
+                if not isinstance(response, SourceResponse) or not isinstance(response.body, bytes) or len(response.body) > 8_000_000:
+                    raise AcquisitionFailure("invalid_or_oversize_response")
+                captured = _time(response.captured_at)
+                if type(response.status) is not int or not (100 <= response.status <= 599 or response.status == 999):
+                    raise AcquisitionFailure("invalid_response_status")
+                if not isinstance(response.content_type, str) or len(response.content_type) > 200:
+                    raise AcquisitionFailure("invalid_content_type")
+            except AcquisitionFailure:
+                connection.execute("UPDATE responses SET outcome='invalid_response' WHERE attempt_id=?", (attempt_id,))
+                return False
+            connection.execute("UPDATE responses SET status=?, content_type=?, captured_at=?, body_sha256=?, body=?, outcome='captured' WHERE attempt_id=?", (
+                response.status, response.content_type, captured,
+                hashlib.sha256(response.body).hexdigest(), response.body, attempt_id,
             ))
         # The original bytes are durably committed before JSON decoding or parsing.
         return False
@@ -181,8 +194,8 @@ def acquire_company_page(*, journal: Journal, scope: str, generation: int,
     replayed = journal.capture(scope=scope, generation=generation, attempt_id=attempt_id,
                                permission=permission, now=now, send=send)
     record = journal.read(attempt_id, now)
-    if record["outcome"] == "transport_failure":
-        return AcquisitionResult(attempt_id, "transport_failure", None, None, replayed)
+    if record["outcome"] in {"dispatch_unknown", "transport_failure", "invalid_response"}:
+        return AcquisitionResult(attempt_id, record["outcome"], None, None, replayed)
     if record["body"] is None:
         return AcquisitionResult(attempt_id, "policy_expired", record["body_sha256"], None, replayed)
     status = record["status"]

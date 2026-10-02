@@ -4,6 +4,8 @@ Standalone LinkedIn parsing and evidence components for NOS. This is the primary
 
 The current implementation includes conservative normalized company-feed parsing, source-specific wire serialization, and a permission-gated original-byte journal with expiry, replay and durable stop handling. It does not register a live collector or recurring workload.
 
+Attempt admission is committed before transport runs. If the process exits before a response is committed, replay returns `dispatch_unknown` and never resends that attempt. This includes a possible crash before any request was sent: the journal cannot distinguish it from a transmitted request whose response was lost. Transport failures and invalid or oversized responses also retain a durable attempt outcome. These states do not establish source absence or successful collection.
+
 ## Install and test
 
 Use Python 3.11 or later. Verification was run locally on Python 3.12.

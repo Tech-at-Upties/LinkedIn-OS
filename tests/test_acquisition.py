@@ -1,7 +1,9 @@
 import json
 import multiprocessing
+import os
 import threading
 from datetime import timedelta
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import urlopen
 
@@ -174,3 +176,86 @@ def test_timeout_attempt_is_durable_and_not_resent_on_restart(tmp_path):
 def test_unrecognized_error_code_is_not_a_secret_or_type_crash(tmp_path):
     result = run(Journal(tmp_path / "journal.sqlite"), lambda: response({"errors": [{"code": {"untrusted": "value"}}]}))
     assert result.outcome == "parse_failure"
+
+
+def crash_after_request(path, url):
+    def send():
+        with urlopen(url, timeout=3) as result:
+            result.read()
+        os._exit(7)
+    run(Journal(path), send)
+
+
+def test_process_crash_after_physical_request_cannot_resend_attempt(tmp_path):
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    path = tmp_path / "journal.sqlite"
+    process = multiprocessing.get_context("spawn").Process(
+        target=crash_after_request,
+        args=(path, f"http://127.0.0.1:{server.server_port}/crash"),
+    )
+    try:
+        process.start()
+        process.join(10)
+        assert process.exitcode == 7 and requests == ["/crash"]
+        calls = []
+        replay = run(Journal(path), lambda: calls.append(1) or response())
+        assert calls == []
+        assert replay.replayed and replay.outcome == "dispatch_unknown"
+        assert replay.body_sha256 is None and replay.page is None
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(3)
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+
+
+@pytest.mark.parametrize("invalid", [
+    None,
+    SourceResponse(200, "application/json", b"x" * 8_000_001, NOW),
+    SourceResponse(True, "application/json", b"{}", NOW),
+    SourceResponse(200, None, b"{}", NOW),
+    SourceResponse(200, "application/json", b"{}", NOW.replace(tzinfo=None)),
+])
+def test_invalid_response_is_durable_and_not_resent(invalid, tmp_path):
+    path = tmp_path / "journal.sqlite"
+    calls = []
+    first = run(Journal(path), lambda: calls.append(1) or invalid)
+    replay = run(Journal(path), lambda: calls.append(1) or response())
+    assert first.outcome == replay.outcome == "invalid_response"
+    assert replay.replayed and calls == [1]
+    assert replay.page is None and replay.body_sha256 is None
+
+
+def test_stop_committed_between_admission_and_dispatch_has_zero_requests(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    journal = Journal(path)
+    generation = journal.generation(SCOPE)
+    connect = journal.connect
+    stopped = False
+    @contextmanager
+    def stop_after_commit():
+        nonlocal stopped
+        with connect() as connection:
+            yield connection
+        if not stopped:
+            stopped = True
+            Journal(path).stop(SCOPE, "operator_stop")
+    journal.connect = stop_after_commit
+    calls = []
+    with pytest.raises(AcquisitionFailure, match="dispatch_fenced"):
+        run(journal, lambda: calls.append(1) or response(), generation=generation)
+    assert calls == []
+    assert Journal(path).read("attempt-one", NOW)["outcome"] == "dispatch_unknown"
