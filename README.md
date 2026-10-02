@@ -1,6 +1,6 @@
 ﻿# NOS LinkedIn evidence components
 
-Standalone LinkedIn parsing and evidence components for NOS. This is the primary development repository. NOS integration lives on `feat/linkedin-m1` in [NOS-V1](https://github.com/Tech-at-Upties/NOS-V1).
+Standalone LinkedIn parsing and evidence components for NOS. This is the primary development repository. NOS integration lives on [`feat/linkedin-m1` in NOS-V1](https://github.com/Tech-at-Upties/NOS-V1/tree/feat/linkedin-m1).
 
 The current implementation includes conservative normalized company-feed parsing, source-specific wire serialization, and a permission-gated original-byte journal with expiry, replay and durable stop handling. It does not register a live collector or recurring workload.
 
@@ -39,4 +39,4 @@ Collection and retention require an established permitted route. A browser login
 
 The native browser probe refuses before launch without a confirmed, unexpired permission record for its exact route and target. Do not create that record to bypass the access requirement. Session profiles, credentials, source receipts and local controller instructions are excluded from this repository.
 
-Current gaps include recipe-specific termination, production transport/access/retention, task/session registration, pinned dependency distribution, Redis delivery/canonical fencing, live error precision and sustained workload measurement. The SQLite dispatch primitive serializes stop commits with an in-flight call; it does not cancel a transmitted request or satisfy the full NOS runtime fence by itself.
+Current gaps include recipe-specific termination, production transport/access/retention, task/session registration, Redis delivery/canonical fencing, live error precision and sustained workload measurement. The SQLite dispatch primitive serializes stop commits with an in-flight call; it does not cancel a transmitted request or satisfy the full NOS runtime fence by itself.
