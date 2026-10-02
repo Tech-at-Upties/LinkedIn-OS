@@ -213,6 +213,38 @@ class Journal:
             connection.execute("UPDATE responses SET outcome=? WHERE attempt_id=? AND scope=?", (outcome, attempt_id, scope))
         return outcome
 
+    def deliver(self, *, scope: str, generation: int, attempt_id: str,
+                now: datetime, send: Callable[[], object]) -> str:
+        """Fence one explicit delivery callback; it must acknowledge or raise.
+
+        A callback failure may follow a remote commit. Explicit replay must
+        reuse the same downstream delivery identity. No automatic retry or
+        durable delivery outbox is provided by this primitive.
+        """
+        _scope(scope)
+        timestamp = _time(now)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            record = connection.execute("SELECT * FROM responses WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if (not record or record["scope"] != scope or record["generation"] != generation
+                    or type(generation) is not int):
+                raise AcquisitionFailure("attempt_identity_conflict")
+            state = connection.execute("SELECT * FROM route_state WHERE scope=?", (scope,)).fetchone()
+            if not state or state["stopped"] or state["generation"] != generation:
+                connection.execute("UPDATE responses SET outcome='quarantined_after_stop' WHERE attempt_id=?", (attempt_id,))
+                return "quarantined_after_stop"
+            self._require_classified(connection, scope)
+            if record["expires_at"] <= timestamp:
+                connection.execute("UPDATE responses SET body=NULL, outcome='policy_expired' WHERE attempt_id=?", (attempt_id,))
+                return "policy_expired"
+            if record["outcome"] not in {"bounded", "partial"} or record["body"] is None:
+                raise AcquisitionFailure("delivery_not_eligible")
+            try:
+                send()
+            except Exception:
+                return "delivery_failure"
+        return "delivery_acknowledged"
+
 
 def acquire_company_page(*, journal: Journal, scope: str, generation: int,
                          permission: RoutePermission, feed_publisher_id: str,

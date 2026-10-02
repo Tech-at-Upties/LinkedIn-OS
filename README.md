@@ -8,6 +8,10 @@ Attempt admission is committed before transport runs. If the process exits befor
 
 Saved responses must be classified before another attempt can dispatch on the source scope. `classification_pending` blocks new requests until the original attempt is replayed without a resend. Expired unclassified bytes leave `classification_expired` and keep that barrier; retained HTTP access status can still establish a durable hold. Replay is bound to the exact original feed publisher and evidence class. `Journal.capture` requires `feed_publisher_id`; older receipts without that context remain readable but cannot be relabeled during replay. Permission flags require actual boolean `True` values.
 
+The NOS branch's opt-in `xingestion.linkedin.executor.execute_company_page` connects one owned source callback to the M1 serializer and a validated M2 admission callback. It uses the source attempt ID as the stable job identity. The Journal checks the source fence, pending classification and expiry around physical delivery; a committed stop suppresses delivery, while a stop arriving during delivery waits for that callback. Explicit replay after an ambiguous delivery can deduplicate in M2 without rereading the source. The callback must acknowledge validated admission or raise. Task/queue registration and a durable delivery outbox remain open.
+
+Delivery callbacks must use a separate destination database and must not reenter the Journal to write. The guard serializes local callback invocation; it cannot cancel a transmitted write or prove that a remote write will not commit later after a timeout. Full runtime/canonical quarantine remains unverified.
+
 ## Install and test
 
 Use Python 3.11 or later. Verification was run locally on Python 3.12.

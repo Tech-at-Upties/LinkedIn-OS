@@ -1,6 +1,7 @@
 """Controlled actual M1 serializer -> M2 converter/model -> SQLite Store."""
 import copy
 import json
+import multiprocessing
 import os
 import sys
 from datetime import timedelta
@@ -20,6 +21,7 @@ from nos_m2.m1 import M1Client, M1Error
 from nos_m2.models import EvidenceEnvelope
 from nos_m2.store import Store
 from xingestion.linkedin.northbound import serialize_company_page
+from xingestion.linkedin.executor import execute_company_page
 
 from nos_linkedin.parser import parse_graph
 from nos_linkedin.acquisition import AcquisitionFailure, Journal, RoutePermission, SourceResponse, acquire_company_page
@@ -186,3 +188,128 @@ def test_access_failure_after_collection_does_not_invent_deleted_evidence(store,
     observations = store.list_observations(item.evidence_id)
     assert len(observations) == 1
     assert observations[0]["availability"] == "available"
+
+
+def execute(journal, calls, deliver, *, clock=lambda: NOW, status=200):
+    def send():
+        calls.append("source")
+        return SourceResponse(status, "application/json", json.dumps(source_envelope()).encode(), NOW)
+    return execute_company_page(journal=journal, feed_publisher_id=COMPANY, attempt_id="m1-company-page",
+                                permission=RoutePermission(True, True, NOW + timedelta(days=1), "synthetic_fixture"),
+                                send=send, deliver=deliver, clock=clock)
+
+
+def commit_stop(path, started, completed):
+    started.set()
+    Journal(path).stop("linkedin.company-feed", "operator_stop")
+    completed.set()
+
+
+def test_m1_executor_stop_after_parse_prevents_actual_m2_admission(store, tmp_path, monkeypatch):
+    path = tmp_path / "executor.sqlite"
+    journal = Journal(path)
+    finish = journal.finish
+    context = multiprocessing.get_context("spawn")
+    started, completed = context.Event(), context.Event()
+    def finish_then_stop(*args):
+        outcome = finish(*args)
+        process = context.Process(target=commit_stop, args=(path, started, completed))
+        process.start()
+        try:
+            assert completed.wait(10)
+            process.join(10)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(3)
+        return outcome
+    monkeypatch.setattr(journal, "finish", finish_then_stop)
+    calls, deliveries = [], []
+    def deliver(result):
+        deliveries.append(result)
+        store.admit(convert(result)[0])
+    result = execute(journal, calls, deliver)
+    assert result.delivery_outcome == "quarantined_after_stop" and deliveries == []
+    assert calls == ["source"] and store.get_evidence("linkedin:urn:li:activity:123") is None
+    assert Journal(path).read(result.attempt_id, NOW)["outcome"] == "quarantined_after_stop"
+
+
+def test_m1_executor_stop_during_delivery_commits_after_actual_m2_admission(store, tmp_path):
+    path = tmp_path / "executor.sqlite"
+    context = multiprocessing.get_context("spawn")
+    started, completed = context.Event(), context.Event()
+    process = context.Process(target=commit_stop, args=(path, started, completed))
+    calls = []
+    def deliver(result):
+        process.start()
+        assert started.wait(10)
+        assert not completed.wait(0.2)
+        store.admit(convert(result)[0])
+    try:
+        result = execute(Journal(path), calls, deliver)
+        assert result.delivery_outcome == "delivery_acknowledged"
+        assert completed.wait(10)
+        process.join(10)
+        assert process.exitcode == 0
+        assert len(store.list_observations("linkedin:urn:li:activity:123")) == 1
+        with pytest.raises(AcquisitionFailure, match="durable_hold"):
+            Journal(path).generation("linkedin.company-feed")
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(3)
+
+
+def test_m1_executor_ambiguous_delivery_replay_is_idempotent_in_m2(store, tmp_path):
+    path = tmp_path / "executor.sqlite"
+    calls, receipts = [], []
+    def commit_then_timeout(result):
+        item = convert(result)[0]
+        assert item.origin.m1_job_id == "m1-company-page"
+        receipts.append(store.admit(item))
+        raise TimeoutError("Synthetic timeout after actual commit")
+    first = execute(Journal(path), calls, commit_then_timeout)
+    assert first.delivery_outcome == "delivery_failure"
+    def acknowledge(result):
+        receipts.append(store.admit(convert(result)[0]))
+    replay = execute(Journal(path), calls, acknowledge)
+    assert replay.replayed and replay.delivery_outcome == "delivery_acknowledged"
+    assert calls == ["source"] and receipts[1].duplicate_delivery
+    assert len(store.list_observations("linkedin:urn:li:activity:123")) == 1
+
+
+def test_m1_executor_expiry_before_delivery_prevents_admission(store, tmp_path):
+    calls, deliveries = [], []
+    times = iter([NOW, NOW + timedelta(days=2)])
+    result = execute(Journal(tmp_path / "executor.sqlite"), calls, deliveries.append, clock=lambda: next(times))
+    assert result.delivery_outcome == "policy_expired" and deliveries == []
+    assert calls == ["source"] and store.get_evidence("linkedin:urn:li:activity:123") is None
+
+
+def test_m1_executor_access_failure_does_not_deliver_an_item(store, tmp_path):
+    calls, deliveries = [], []
+    result = execute(Journal(tmp_path / "executor.sqlite"), calls, deliveries.append, status=403)
+    assert result.source_outcome == "restricted" and result.delivery_outcome is None
+    assert calls == ["source"] and deliveries == []
+    assert store.get_evidence("linkedin:urn:li:activity:123") is None
+
+
+def test_m1_executor_unclassified_response_between_parse_and_delivery_blocks_sink(store, tmp_path, monkeypatch):
+    path = tmp_path / "executor.sqlite"
+    journal = Journal(path)
+    finish = journal.finish
+    def finish_then_capture(*args):
+        outcome = finish(*args)
+        other = Journal(path)
+        other.capture(scope="linkedin.company-feed", generation=other.generation("linkedin.company-feed"),
+                      attempt_id="pending-security", feed_publisher_id=COMPANY,
+                      permission=RoutePermission(True, True, NOW + timedelta(days=1), "synthetic_fixture"), now=NOW,
+                      send=lambda: SourceResponse(403, "application/json", b"{}", NOW))
+        return outcome
+    monkeypatch.setattr(journal, "finish", finish_then_capture)
+    calls, deliveries = [], []
+    with pytest.raises(AcquisitionFailure, match="classification_pending"):
+        execute(journal, calls, deliveries.append)
+    assert calls == ["source"] and deliveries == []
+    assert store.get_evidence("linkedin:urn:li:activity:123") is None
