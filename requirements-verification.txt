@@ -1,0 +1,11 @@
+# Minimal source-boundary tests. These do not install M2 model/provider extras.
+pytest>=8,<10
+pydantic>=2.11,<3
+SQLAlchemy>=2.0,<2.1
+httpx>=0.28,<0.29
+psycopg[binary,pool]==3.2.3
+redis==5.2.1
+# M1 imports the existing X signing module during worker import. Never fetch X.
+xclienttransaction==1.0.3
+beautifulsoup4==4.15.0
+feedparser==6.0.11

@@ -1,0 +1,44 @@
+{
+  "archive": "NOS_LinkedIn_Investigation_Pass_006.zip",
+  "archive_bytes": 1671344,
+  "archive_sha256": "1000f002288b164839cb31cd4b5b3da65f7804dcdced546c995e4e844022fd18",
+  "zip_crc_pass": true,
+  "zip_file_count": 201,
+  "current_manifest_count": 200,
+  "all_current_manifest_hashes_match": true,
+  "incoming_manifest_count": 164,
+  "all_incoming_entries_preserved_or_archived_and_verified_in_zip": true,
+  "incoming_state_blocks": 164,
+  "all_incoming_state_blocks_accounted_for": true,
+  "all_prior_state_ids_retained": true,
+  "current_project_source_copies_compared": 12,
+  "all_current_project_source_copies_match_snapshot": true,
+  "syntax_and_local_links_checked": true,
+  "performed_test_results": {
+    "python": "3.13.5",
+    "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+    "sqlite": "3.46.1",
+    "python_test_count": 47,
+    "python_returncode": 0,
+    "node": "v22.16.0",
+    "node_returncode": 0,
+    "copied_classifier_cases": 18,
+    "copied_transport_cases": 8,
+    "network_requests": 0,
+    "live_signal_validation": false,
+    "M1_production_validation": false,
+    "physical_dispatch_fence_validation": false,
+    "same_task_reassignment_blocked": true,
+    "initial_run": "44 passed; later reassignment probe failed; fixed with three new tests, final47"
+  },
+  "decoder_regression": {
+    "tests": 33,
+    "exit": 0
+  },
+  "limits": [
+    "Accessible baseline only; no unseen-history guarantee.",
+    "Hash/text checks do not upgrade source assertions or fixture provenance.",
+    "No real LinkedIn/provider request, current security-signal validation, physical dispatch fence or production M1/M2 test.",
+    "Earlier suites retained, not all rerun this pass."
+  ]
+}

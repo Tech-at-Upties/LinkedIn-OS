@@ -1,0 +1,16 @@
+{
+  "checkpoint": "NOS-LINKEDIN-STATE-006",
+  "archive": "/mnt/data/NOS_LinkedIn_Iteration_006.zip",
+  "archive_bytes": 944868,
+  "archive_sha256": "4aae5e4e0d0fb6801d4aa887484d8171564ea2f5217d3761530bcc691db4ab05",
+  "crc_first_bad_member": null,
+  "archive_file_count": 313,
+  "root_manifest_entries": 312,
+  "all_members_match_manifest": true,
+  "previous_archive_files_compared": 296,
+  "previous_archive_files_changed": 0,
+  "mechanical_checks_passed": 16,
+  "new_collector_tests_run": 0,
+  "earlier_suites_rerun": false,
+  "scope": "Archive/member/cross-archive and research-catalog checks. Not source behavior, legal clearance, perfect semantic retention or live integration verification."
+}

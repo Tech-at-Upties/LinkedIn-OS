@@ -1,0 +1,25 @@
+.venv/
+.local/
+__pycache__/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+
+# Local controller instructions and checkpoints are not publication artifacts.
+**/AGENTS.md
+/GOAL.md
+/STATE.md
+/LOOP.md
+/VERIFY.md
+/CONTEXT_INDEX.md
+/KICKOFF_PROMPT.md
+/PACKAGE_MANIFEST.json
+/docs/work/
+/docs/results/
+
+# Packaging and local development output.
+*.egg-info/
+build/
+dist/
+node_modules/
