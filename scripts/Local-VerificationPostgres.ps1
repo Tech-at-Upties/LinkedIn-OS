@@ -36,7 +36,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $dataPath 'postmaster.pid'))) {
     # Start-Process -Wait also waits for the long-lived PostgreSQL descendants.
     # Wait only for pg_ctl, which reports startup success and then exits.
     if (-not $process.WaitForExit(30000)) { throw 'pg_ctl startup did not finish within 30 seconds.' }
-    $process.Refresh()
-    if ($process.ExitCode -ne 0) { throw 'Project-local PostgreSQL start failed; inspect .local/postgres-start*.log.' }
 }
+# Start-Process can expose a null ExitCode after WaitForExit on this host.
+# Verify the intended project server directly instead of rejecting that null.
+& $controlPath status -D $dataPath *> (Join-Path $expectedParent 'postgres-status.log')
+if ($LASTEXITCODE -ne 0) { throw 'Project-local PostgreSQL is not running; inspect .local/postgres-start*.log and postgres-status.log.' }
 Write-Output 'Project verification PostgreSQL: 127.0.0.1:15432, user nos_test, database postgres. Stop with -Stop.'

@@ -17,7 +17,7 @@ from typing import Callable
 from uuid import uuid4
 
 from .models import ParsedPage
-from .parser import ParseFailure, parse_company_feed
+from .parser import native_id, parse_company_feed
 
 
 class AcquisitionFailure(RuntimeError):
@@ -78,6 +78,10 @@ class Journal:
                   status INTEGER, content_type TEXT, captured_at REAL,
                   evidence_class TEXT NOT NULL, body_sha256 TEXT,
                   expires_at REAL NOT NULL, body BLOB, outcome TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS response_classification
+                  ON responses(scope, outcome);
+                CREATE TABLE IF NOT EXISTS attempt_context (
+                  attempt_id TEXT PRIMARY KEY, feed_publisher_id TEXT NOT NULL);
             """)
 
     @contextmanager
@@ -110,18 +114,34 @@ class Journal:
 
     def read(self, attempt_id: str, now: datetime):
         with self.connect() as connection:
-            connection.execute("UPDATE responses SET body=NULL, outcome='policy_expired' WHERE expires_at<=? AND body IS NOT NULL", (_time(now),))
+            connection.execute("""UPDATE responses SET body=NULL,
+                outcome=CASE WHEN outcome='captured' THEN 'classification_expired'
+                             ELSE 'policy_expired' END
+                WHERE expires_at<=? AND body IS NOT NULL""", (_time(now),))
             row = connection.execute("SELECT * FROM responses WHERE attempt_id=?", (attempt_id,)).fetchone()
             return dict(row) if row else None
 
+    @staticmethod
+    def _require_classified(connection, scope: str) -> None:
+        # A committed response might contain an access/security signal. Its
+        # owner may have exited before classifying it. Replay that attempt
+        # before dispatching new work; absence after expiry is not clearance.
+        pending = connection.execute("""SELECT 1 FROM responses WHERE scope=?
+            AND outcome IN ('captured', 'classification_expired') LIMIT 1""", (scope,)).fetchone()
+        if pending:
+            raise AcquisitionFailure("classification_pending")
+
     def capture(self, *, scope: str, generation: int, attempt_id: str,
-                permission: RoutePermission, now: datetime, send: Callable[[], SourceResponse]):
+                feed_publisher_id: str, permission: RoutePermission,
+                now: datetime, send: Callable[[], SourceResponse]):
         _scope(scope)
         if type(generation) is not int or generation < 0:
             raise AcquisitionFailure("invalid_generation")
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", attempt_id):
+        if not isinstance(attempt_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", attempt_id):
             raise AcquisitionFailure("invalid_attempt_id")
-        if not permission.collection_allowed or not permission.raw_retention_allowed:
+        if not native_id(feed_publisher_id):
+            raise AcquisitionFailure("invalid_feed_publisher")
+        if permission.collection_allowed is not True or permission.raw_retention_allowed is not True:
             raise AcquisitionFailure("route_permission_required")
         expires = _time(permission.raw_expires_at)
         if expires <= _time(now):
@@ -135,14 +155,21 @@ class Journal:
             state = connection.execute("SELECT * FROM route_state WHERE scope=?", (scope,)).fetchone()
             if not state or state["stopped"] or state["generation"] != generation:
                 raise AcquisitionFailure("dispatch_fenced")
-            existing = connection.execute("SELECT scope, generation FROM responses WHERE attempt_id=?", (attempt_id,)).fetchone()
+            existing = connection.execute("SELECT scope, generation, evidence_class FROM responses WHERE attempt_id=?", (attempt_id,)).fetchone()
             if existing:
-                if existing["scope"] != scope or existing["generation"] != generation:
+                context = connection.execute("SELECT feed_publisher_id FROM attempt_context WHERE attempt_id=?", (attempt_id,)).fetchone()
+                if not context:
+                    raise AcquisitionFailure("legacy_attempt_context_missing")
+                if (existing["scope"] != scope or existing["generation"] != generation
+                        or context["feed_publisher_id"] != feed_publisher_id
+                        or existing["evidence_class"] != permission.evidence_class):
                     raise AcquisitionFailure("attempt_identity_conflict")
                 return True
+            self._require_classified(connection, scope)
             connection.execute("INSERT INTO responses VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, 'dispatch_unknown')", (
                 attempt_id, scope, generation, permission.evidence_class, expires,
             ))
+            connection.execute("INSERT INTO attempt_context VALUES (?, ?)", (attempt_id, feed_publisher_id))
         with self.connect() as connection:
             # Recheck after admission, at physical dispatch. An in-flight send
             # finishes before a concurrent stop can commit. Only the caller
@@ -151,6 +178,7 @@ class Journal:
             state = connection.execute("SELECT * FROM route_state WHERE scope=?", (scope,)).fetchone()
             if not state or state["stopped"] or state["generation"] != generation:
                 raise AcquisitionFailure("dispatch_fenced")
+            self._require_classified(connection, scope)
             try:
                 response = send()
             except Exception:
@@ -192,17 +220,17 @@ def acquire_company_page(*, journal: Journal, scope: str, generation: int,
                          attempt_id: str | None = None) -> AcquisitionResult:
     attempt_id = attempt_id or uuid4().hex
     replayed = journal.capture(scope=scope, generation=generation, attempt_id=attempt_id,
-                               permission=permission, now=now, send=send)
+                               feed_publisher_id=feed_publisher_id, permission=permission, now=now, send=send)
     record = journal.read(attempt_id, now)
     if record["outcome"] in {"dispatch_unknown", "transport_failure", "invalid_response"}:
         return AcquisitionResult(attempt_id, record["outcome"], None, None, replayed)
-    if record["body"] is None:
-        return AcquisitionResult(attempt_id, "policy_expired", record["body_sha256"], None, replayed)
     status = record["status"]
     if status in {401, 403, 429, 999}:
         reason = "authentication_required" if status == 401 else "restricted"
         journal.stop(scope, reason)
         outcome = reason
+    elif record["body"] is None:
+        return AcquisitionResult(attempt_id, record["outcome"], record["body_sha256"], None, replayed)
     elif not 200 <= status < 300:
         outcome = "http_failure"
     elif "json" not in record["content_type"].lower():

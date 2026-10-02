@@ -6,6 +6,8 @@ The current implementation includes conservative normalized company-feed parsing
 
 Attempt admission is committed before transport runs. If the process exits before a response is committed, replay returns `dispatch_unknown` and never resends that attempt. This includes a possible crash before any request was sent: the journal cannot distinguish it from a transmitted request whose response was lost. Transport failures and invalid or oversized responses also retain a durable attempt outcome. These states do not establish source absence or successful collection.
 
+Saved responses must be classified before another attempt can dispatch on the source scope. `classification_pending` blocks new requests until the original attempt is replayed without a resend. Expired unclassified bytes leave `classification_expired` and keep that barrier; retained HTTP access status can still establish a durable hold. Replay is bound to the exact original feed publisher and evidence class. `Journal.capture` requires `feed_publisher_id`; older receipts without that context remain readable but cannot be relabeled during replay. Permission flags require actual boolean `True` values.
+
 ## Install and test
 
 Use Python 3.11 or later. Verification was run locally on Python 3.12.

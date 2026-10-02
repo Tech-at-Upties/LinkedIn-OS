@@ -1,5 +1,6 @@
 """Controlled actual M1 serializer -> M2 converter/model -> SQLite Store."""
 import copy
+import json
 import os
 import sys
 from datetime import timedelta
@@ -21,7 +22,8 @@ from nos_m2.store import Store
 from xingestion.linkedin.northbound import serialize_company_page
 
 from nos_linkedin.parser import parse_graph
-from test_parser import COMPANY, NOW, ROOT, fixture
+from nos_linkedin.acquisition import AcquisitionFailure, Journal, RoutePermission, SourceResponse, acquire_company_page
+from test_parser import COMPANY, NOW, ROOT, envelope as source_envelope, fixture
 
 
 def wire(nodes=None, *, observed=NOW, job="job-li-1"):
@@ -128,3 +130,59 @@ def test_boundary_rejects_inconsistent_source_claims(mutate):
     mutate(result["items"][0])
     with pytest.raises(M1Error):
         convert(result)
+
+
+def acquire(journal, body, calls, *, attempt="captured", status=200):
+    def send():
+        calls.append(attempt)
+        return SourceResponse(status, "application/json", json.dumps(body).encode(), NOW)
+    return acquire_company_page(
+        journal=journal, scope="linkedin.company-feed", generation=journal.generation("linkedin.company-feed"),
+        permission=RoutePermission(True, True, NOW + timedelta(days=1), "synthetic_fixture"),
+        feed_publisher_id=COMPANY, send=send, now=NOW, attempt_id=attempt,
+    )
+
+
+def test_captured_response_reshare_and_replay_through_actual_m1_m2(store, tmp_path):
+    body = source_envelope()
+    original = copy.deepcopy(body["included"][0])
+    original["entityUrn"] = "urn:li:fsd_update:(urn:li:activity:987,ORIGINAL)"
+    original["metadata"].update(backendUrn="urn:li:activity:987", shareUrn="urn:li:ugcPost:654")
+    original["actor"]["backendUrn"] = "urn:li:company:888"
+    original["commentary"]["text"]["text"] = "Original author's separate text"
+    body["included"][0]["resharedUpdate"] = original["entityUrn"]
+    body["included"].append(original)
+    path = tmp_path / "capture.sqlite"
+    calls = []
+    captured = acquire(Journal(path), body, calls)
+    assert captured.page is not None
+    result = serialize_company_page(captured.page, job_id="job-captured-reshare")
+    item = convert(result)[0]
+    receipt = store.admit(item)
+    saved = store.get_evidence(receipt.evidence_id)
+    assert item.text == "Own commentary" and item.author.account_id == "urn:li:company:999"
+    assert saved["references"][0]["evidence_id"] == "linkedin:urn:li:activity:987"
+    assert item.raw_payload["m1_item"]["source_fields"]["feed_publisher_id"] == COMPANY
+    assert len(store.list_observations(item.evidence_id)) == 1
+    replay = acquire(Journal(path), {"not": "the original response"}, calls)
+    replayed = convert(serialize_company_page(replay.page, job_id="job-captured-reshare"))[0]
+    assert replay.replayed and replay.body_sha256 == captured.body_sha256 and calls == ["captured"]
+    assert store.admit(replayed).duplicate_delivery
+    assert len(store.list_observations(item.evidence_id)) == 1
+
+
+def test_access_failure_after_collection_does_not_invent_deleted_evidence(store, tmp_path):
+    path = tmp_path / "capture.sqlite"
+    calls = []
+    captured = acquire(Journal(path), source_envelope(), calls)
+    item = convert(serialize_company_page(captured.page, job_id="job-before-access-stop"))[0]
+    store.admit(item)
+    denied = acquire(Journal(path), {}, calls, attempt="denied", status=403)
+    assert denied.outcome == "restricted" and denied.page is None
+    assert Journal(path).read("denied", NOW)["body"] == b"{}"
+    with pytest.raises(AcquisitionFailure, match="durable_hold"):
+        acquire(Journal(path), source_envelope(), calls, attempt="after-restart")
+    assert calls == ["captured", "denied"]
+    observations = store.list_observations(item.evidence_id)
+    assert len(observations) == 1
+    assert observations[0]["availability"] == "available"

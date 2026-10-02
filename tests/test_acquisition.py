@@ -259,3 +259,187 @@ def test_stop_committed_between_admission_and_dispatch_has_zero_requests(tmp_pat
         run(journal, lambda: calls.append(1) or response(), generation=generation)
     assert calls == []
     assert Journal(path).read("attempt-one", NOW)["outcome"] == "dispatch_unknown"
+
+
+def capture_without_classifying(journal, payload, *, attempt_id="unclassified"):
+    return journal.capture(scope=SCOPE, generation=journal.generation(SCOPE),
+                           attempt_id=attempt_id, feed_publisher_id=COMPANY, permission=permission(), now=NOW,
+                           send=lambda: payload)
+
+
+def test_replay_cannot_relabel_a_saved_response_as_another_company_feed(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    calls = []
+    first = run(Journal(path), lambda: calls.append(1) or response())
+    assert first.page.publications[0].feed_publisher_id == COMPANY
+    with pytest.raises(AcquisitionFailure, match="attempt_identity_conflict"):
+        run(Journal(path), lambda: calls.append(1) or response(), feed_publisher_id="urn:li:fsd_company:9999")
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("changes", [
+    {"collection_allowed": "false"}, {"collection_allowed": 1},
+    {"raw_retention_allowed": "true"}, {"raw_retention_allowed": 1},
+])
+def test_non_boolean_permission_never_dispatches(changes, tmp_path):
+    calls = []
+    with pytest.raises(AcquisitionFailure, match="route_permission_required"):
+        run(Journal(tmp_path / "journal.sqlite"), lambda: calls.append(1) or response(), permission=permission(**changes))
+    assert calls == []
+
+
+def test_replay_cannot_change_original_evidence_class(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    calls = []
+    run(Journal(path), lambda: calls.append(1) or response())
+    with pytest.raises(AcquisitionFailure, match="attempt_identity_conflict"):
+        run(Journal(path), lambda: calls.append(1) or response(), permission=permission(evidence_class="native_response"))
+    assert calls == [1]
+
+
+def test_legacy_receipt_stays_readable_without_guessing_feed_context(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    calls = []
+    journal = Journal(path)
+    first = run(journal, lambda: calls.append(1) or response())
+    with journal.connect() as connection:
+        # This disposable test database represents the preceding schema.
+        connection.execute("DROP TABLE attempt_context")
+    reopened = Journal(path)
+    assert reopened.read(first.attempt_id, NOW)["body_sha256"] == first.body_sha256
+    with pytest.raises(AcquisitionFailure, match="legacy_attempt_context_missing"):
+        run(reopened, lambda: calls.append(1) or response())
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("payload", [response(), response({}, 403), response({"errors": [{"code": "CHALLENGE"}]})])
+def test_saved_unclassified_response_blocks_next_attempt_after_reopen(payload, tmp_path):
+    path = tmp_path / "journal.sqlite"
+    capture_without_classifying(Journal(path), payload)
+    calls = []
+    with pytest.raises(AcquisitionFailure, match="classification_pending"):
+        run(Journal(path), lambda: calls.append(1) or response(), attempt_id="next")
+    assert calls == []
+    assert Journal(path).read("unclassified", NOW)["body"] == payload.body
+
+
+def test_benign_saved_response_replay_releases_classification_barrier(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    capture_without_classifying(Journal(path), response())
+    calls = []
+    first = run(Journal(path), lambda: calls.append(1) or response(), attempt_id="unclassified")
+    assert first.replayed and first.page is not None and calls == []
+    next_result = run(Journal(path), lambda: calls.append(1) or response(), attempt_id="next")
+    assert next_result.page is not None and calls == [1]
+
+
+def test_saved_semantic_challenge_replay_commits_hold_without_resending(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    capture_without_classifying(Journal(path), response({"errors": [{"code": "CHALLENGE"}]}))
+    calls = []
+    result = run(Journal(path), lambda: calls.append(1) or response(), attempt_id="unclassified")
+    assert result.replayed and result.outcome == "challenge" and calls == []
+    with pytest.raises(AcquisitionFailure, match="durable_hold"):
+        Journal(path).generation(SCOPE)
+
+
+def test_expired_unclassified_body_preserves_uncertainty_and_dispatch_barrier(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    capture_without_classifying(Journal(path), response({"errors": [{"code": "CHALLENGE"}]}))
+    now = NOW + timedelta(days=2)
+    journal = Journal(path)
+    row = journal.read("unclassified", now)
+    assert row["body"] is None and row["outcome"] == "classification_expired"
+    calls = []
+    permitted = permission(raw_expires_at=now + timedelta(days=1))
+    replay = run(journal, lambda: calls.append(1) or response(), now=now,
+                 permission=permitted, attempt_id="unclassified")
+    assert replay.replayed and replay.outcome == "classification_expired" and replay.page is None
+    with pytest.raises(AcquisitionFailure, match="classification_pending"):
+        run(Journal(path), lambda: calls.append(1) or response(), now=now,
+            permission=permitted, attempt_id="next")
+    assert calls == []
+
+
+def test_status_access_failure_remains_classifiable_after_raw_expiry(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    capture_without_classifying(Journal(path), response({}, 403))
+    now = NOW + timedelta(days=2)
+    calls = []
+    result = run(Journal(path), lambda: calls.append(1) or response(), now=now,
+                 permission=permission(raw_expires_at=now + timedelta(days=1)), attempt_id="unclassified")
+    assert result.replayed and result.outcome == "restricted" and calls == []
+    assert Journal(path).read("unclassified", now)["body"] is None
+    with pytest.raises(AcquisitionFailure, match="durable_hold"):
+        Journal(path).generation(SCOPE)
+
+
+def test_response_saved_after_admission_is_checked_at_physical_dispatch(tmp_path):
+    path = tmp_path / "journal.sqlite"
+    journal = Journal(path)
+    generation = journal.generation(SCOPE)
+    connect = journal.connect
+    inserted = False
+    @contextmanager
+    def save_after_admission():
+        nonlocal inserted
+        with connect() as connection:
+            yield connection
+        if not inserted:
+            inserted = True
+            capture_without_classifying(Journal(path), response({}, 403))
+    journal.connect = save_after_admission
+    calls = []
+    with pytest.raises(AcquisitionFailure, match="classification_pending"):
+        run(journal, lambda: calls.append(1) or response(), generation=generation)
+    assert calls == []
+
+
+def exit_after_committing_response(path, url):
+    journal = Journal(path)
+    def send():
+        with urlopen(url, timeout=3) as result:
+            return SourceResponse(result.status, result.headers["Content-Type"], result.read(), NOW)
+    journal.capture(scope=SCOPE, generation=journal.generation(SCOPE), attempt_id="unclassified",
+                    feed_publisher_id=COMPANY, permission=permission(), now=NOW, send=send)
+    os._exit(9)
+
+
+def test_committed_security_response_after_process_exit_blocks_physical_request(tmp_path):
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"errors":[{"code":"CHALLENGE"}]}')
+        def log_message(self, *_):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    path = tmp_path / "journal.sqlite"
+    url = f"http://127.0.0.1:{server.server_port}/pending"
+    process = multiprocessing.get_context("spawn").Process(target=exit_after_committing_response, args=(path, url))
+    def send():
+        with urlopen(url, timeout=3) as result:
+            return SourceResponse(result.status, result.headers["Content-Type"], result.read(), NOW)
+    try:
+        process.start()
+        process.join(10)
+        assert process.exitcode == 9 and requests == ["/pending"]
+        with pytest.raises(AcquisitionFailure, match="classification_pending"):
+            run(Journal(path), send, attempt_id="next")
+        replay = run(Journal(path), send, attempt_id="unclassified")
+        assert replay.replayed and replay.outcome == "challenge"
+        assert requests == ["/pending"]
+        with pytest.raises(AcquisitionFailure, match="durable_hold"):
+            Journal(path).generation(SCOPE)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(3)
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
