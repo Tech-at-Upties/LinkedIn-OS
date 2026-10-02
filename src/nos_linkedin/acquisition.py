@@ -116,12 +116,25 @@ class Journal:
             connection.execute("INSERT OR IGNORE INTO route_state VALUES (?, 0, 0, NULL)", (scope,))
             connection.execute("UPDATE route_state SET generation=generation+1, stopped=1, reason=? WHERE scope=?", (reason, scope))
 
+    @staticmethod
+    def _purge_expired(connection, now: datetime):
+        return connection.execute("""UPDATE responses SET body=NULL,
+            outcome=CASE WHEN outcome='captured' THEN 'classification_expired'
+                         ELSE 'policy_expired' END
+            WHERE expires_at<=? AND body IS NOT NULL""", (_time(now),)).rowcount
+
+    def purge_expired(self, now: datetime) -> int:
+        """Remove expired retained bytes without requiring a result read.
+
+        Unclassified expiry retains its dispatch barrier; policy expiry is
+        not a source deletion or permission to resend an unknown attempt.
+        """
+        with self.connect() as connection:
+            return self._purge_expired(connection, now)
+
     def read(self, attempt_id: str, now: datetime):
         with self.connect() as connection:
-            connection.execute("""UPDATE responses SET body=NULL,
-                outcome=CASE WHEN outcome='captured' THEN 'classification_expired'
-                             ELSE 'policy_expired' END
-                WHERE expires_at<=? AND body IS NOT NULL""", (_time(now),))
+            self._purge_expired(connection, now)
             row = connection.execute("SELECT * FROM responses WHERE attempt_id=?", (attempt_id,)).fetchone()
             return dict(row) if row else None
 

@@ -18,6 +18,8 @@ The Journal can retain native responses, allowlisted source projections and synt
 
 Ownership guards are read-only; callbacks must not reenter Journal/run writes. Durable acknowledgement receipts support cursor checkpoints, not automatic delivery retries or a distributed outbox. A source admission followed by owner loss can remain `dispatch_unknown` even if the guard prevented transport; recovery does not invent a safe resend.
 
+`Journal.purge_expired` removes expired retained bytes independently of result requests while preserving unresolved classification barriers. The NOS branch now has a controlled source-specific generic job runtime with actual PostgreSQL ownership, authenticated northbound results and local M2 HTTP admission. Generic task storage holds coverage/expiry metadata without duplicating source text; results are rebuilt only from eligible acknowledged bytes. See NOS `M1/docs/LINKEDIN_CONTROLLED_RUNTIME.md` for explicit saved-projection setup. This mode makes no LinkedIn requests. Real Redis delivery, live startup transport, downstream derived retention and remote late canonical fencing remain open.
+
 ## Install and test
 
 Use Python 3.11 or later. Verification was run locally on Python 3.12.
@@ -31,9 +33,11 @@ python -m venv .venv
 
 Synthetic tests verify parser, field-state, failure and durability behavior. A private projected-receipt check skips when its local artifact is absent. Synthetic/projected checks do not prove live source semantics.
 
-For controlled NOS integration, check out its `feat/linkedin-m1` branch separately and set `NOS_INTEGRATION_ROOT` to that checkout before running tests. Install this package in the same verification environment. The actual M1 serializer, M2 converter/model and Store are exercised; no live task or HTTP route is enabled.
+For controlled NOS integration, check out its `feat/linkedin-m1` branch separately and set `NOS_INTEGRATION_ROOT` to that checkout before running tests. Install this package in the same verification environment. Tests exercise actual M1 serialization, generic task ownership, northbound/local M2 HTTP and M2 service/storage. LinkedIn runtime remains disabled until explicitly configured; Redis delivery is tested separately.
 
 `NOS_M2_TEST_DATABASE_URL` enables the integration suite's real Postgres storage cases using temporary schemas. Use a dedicated test instance; those schemas are removed by the tests. On a machine with PostgreSQL 17 already installed, `scripts/Local-VerificationPostgres.ps1` can create an isolated project-owned cluster on localhost port 15432. Check ownership with `scripts/check-verification-postgres.py` before running fixtures that truncate their dedicated test database, and stop that cluster with the helper's `-Stop` option.
+
+`XINGESTION_TEST_POSTGRES_DSN` enables the real generic job/lease cases. Point it at a separate disposable task database: the existing NOS task fixture migrates and truncates its task/outbox tables. Do not run fixtures against a live stack database or run independent truncating suites concurrently.
 
 ## Evidence semantics
 

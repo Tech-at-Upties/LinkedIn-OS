@@ -31,6 +31,24 @@ def response(body=None, status=200, content_type="application/vnd.linkedin.norma
     return SourceResponse(status, content_type, json.dumps(envelope() if body is None else body).encode(), NOW)
 
 
+def test_explicit_expiry_sweep_keeps_unclassified_dispatch_barrier(tmp_path):
+    journal = Journal(tmp_path / 'expiry.sqlite')
+    generation = journal.generation(SCOPE)
+    journal.capture(scope=SCOPE, generation=generation, attempt_id='unclassified', feed_publisher_id=COMPANY,
+                    permission=permission(), now=NOW, send=response)
+    assert journal.purge_expired(NOW + timedelta(days=2)) == 1
+    assert journal.purge_expired(NOW + timedelta(days=2)) == 0
+    with journal.connect() as connection:
+        record = connection.execute('SELECT body,outcome FROM responses').fetchone()
+        assert record['body'] is None and record['outcome'] == 'classification_expired'
+    calls = []
+    with pytest.raises(AcquisitionFailure, match='classification_pending'):
+        journal.capture(scope=SCOPE, generation=generation, attempt_id='other', feed_publisher_id=COMPANY,
+            permission=permission(raw_expires_at=NOW + timedelta(days=3)), now=NOW + timedelta(days=2),
+            send=lambda: calls.append(1) or response())
+    assert calls == []
+
+
 def test_original_committed_before_parse_failure_and_no_retry(tmp_path):
     journal = Journal(tmp_path / "journal.sqlite")
     calls = []
