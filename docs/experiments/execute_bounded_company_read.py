@@ -105,7 +105,14 @@ def main() -> dict:
                                      feed_publisher_id=publisher, attempt_id=attempt,
                                      send=send, deliver=deliver)
         if native_receipt and native_receipt['receipt']['stopped']:
-            journal.stop('linkedin.company-feed', native_receipt['receipt']['stopped']['reason'])
+            observed_reason = native_receipt['receipt']['stopped']['reason']
+            # Preserve the observation in its receipt. Normalize only to the
+            # Journal's bounded stop vocabulary, without promoting candidates.
+            stop_reason = ('authentication_required' if observed_reason == 'authentication_required'
+                           else 'challenge' if observed_reason == 'challenge_path'
+                           else 'restricted' if observed_reason.startswith('restricted_http_')
+                           else 'operator_stop')
+            journal.stop('linkedin.company-feed', stop_reason)
         if first.delivery_outcome != 'delivery_acknowledged':
             return {'attempt_id': attempt, 'first': asdict(first), 'native_receipt': native_receipt['path'] if native_receipt else None,
                     'native_stop': native_receipt['receipt']['stopped'] if native_receipt else None,

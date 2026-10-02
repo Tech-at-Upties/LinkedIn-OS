@@ -82,6 +82,10 @@ class Journal:
                   ON responses(scope, outcome);
                 CREATE TABLE IF NOT EXISTS attempt_context (
                   attempt_id TEXT PRIMARY KEY, feed_publisher_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS delivery_receipts (
+                  attempt_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
+                  body_sha256 TEXT NOT NULL, eligibility_checked_at REAL NOT NULL,
+                  outcome TEXT NOT NULL);
             """)
 
     @contextmanager
@@ -133,7 +137,8 @@ class Journal:
 
     def capture(self, *, scope: str, generation: int, attempt_id: str,
                 feed_publisher_id: str, permission: RoutePermission,
-                now: datetime, send: Callable[[], SourceResponse]):
+                now: datetime, send: Callable[[], SourceResponse],
+                operation_guard: Callable[[], object] | None = None):
         _scope(scope)
         if type(generation) is not int or generation < 0:
             raise AcquisitionFailure("invalid_generation")
@@ -155,6 +160,8 @@ class Journal:
             state = connection.execute("SELECT * FROM route_state WHERE scope=?", (scope,)).fetchone()
             if not state or state["stopped"] or state["generation"] != generation:
                 raise AcquisitionFailure("dispatch_fenced")
+            if operation_guard is not None:
+                operation_guard()
             existing = connection.execute("SELECT scope, generation, evidence_class FROM responses WHERE attempt_id=?", (attempt_id,)).fetchone()
             if existing:
                 context = connection.execute("SELECT feed_publisher_id FROM attempt_context WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -179,6 +186,8 @@ class Journal:
             if not state or state["stopped"] or state["generation"] != generation:
                 raise AcquisitionFailure("dispatch_fenced")
             self._require_classified(connection, scope)
+            if operation_guard is not None:
+                operation_guard()
             try:
                 response = send()
             except Exception:
@@ -214,7 +223,8 @@ class Journal:
         return outcome
 
     def deliver(self, *, scope: str, generation: int, attempt_id: str,
-                now: datetime, send: Callable[[], object]) -> str:
+                now: datetime, send: Callable[[], object],
+                operation_guard: Callable[[], object] | None = None) -> str:
         """Fence one explicit delivery callback; it must acknowledge or raise.
 
         A callback failure may follow a remote commit. Explicit replay must
@@ -239,20 +249,29 @@ class Journal:
                 return "policy_expired"
             if record["outcome"] not in {"bounded", "partial"} or record["body"] is None:
                 raise AcquisitionFailure("delivery_not_eligible")
+            if operation_guard is not None:
+                operation_guard()
             try:
                 send()
             except Exception:
+                connection.execute("INSERT OR REPLACE INTO delivery_receipts VALUES (?, ?, ?, ?, ?)",
+                                   (attempt_id, generation, record["body_sha256"], timestamp, "delivery_failure"))
                 return "delivery_failure"
+            connection.execute("INSERT OR REPLACE INTO delivery_receipts VALUES (?, ?, ?, ?, ?)",
+                               (attempt_id, generation, record["body_sha256"], timestamp, "delivery_acknowledged"))
         return "delivery_acknowledged"
 
 
 def acquire_company_page(*, journal: Journal, scope: str, generation: int,
                          permission: RoutePermission, feed_publisher_id: str,
                          send: Callable[[], SourceResponse], now: datetime,
-                         attempt_id: str | None = None) -> AcquisitionResult:
+                         attempt_id: str | None = None,
+                         operation_guard: Callable[[], object] | None = None,
+                         page_validator: Callable[[ParsedPage], object] | None = None) -> AcquisitionResult:
     attempt_id = attempt_id or uuid4().hex
     replayed = journal.capture(scope=scope, generation=generation, attempt_id=attempt_id,
-                               feed_publisher_id=feed_publisher_id, permission=permission, now=now, send=send)
+                               feed_publisher_id=feed_publisher_id, permission=permission, now=now, send=send,
+                               operation_guard=operation_guard)
     record = journal.read(attempt_id, now)
     if record["outcome"] in {"dispatch_unknown", "transport_failure", "invalid_response"}:
         return AcquisitionResult(attempt_id, record["outcome"], None, None, replayed)
@@ -279,6 +298,8 @@ def acquire_company_page(*, journal: Journal, scope: str, generation: int,
             page = parse_company_feed(body, feed_publisher_id=feed_publisher_id,
                                       observed_at=datetime.fromtimestamp(record["captured_at"], UTC),
                                       evidence_class=record["evidence_class"])
+            if page_validator is not None:
+                page_validator(page)
         except (ValueError, UnicodeDecodeError, RecursionError):
             outcome = "parse_failure"
         else:

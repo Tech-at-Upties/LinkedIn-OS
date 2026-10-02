@@ -14,6 +14,10 @@ Delivery callbacks must use a separate destination database and must not reenter
 
 The Journal can retain native responses, allowlisted source projections and synthetic fixtures. It preserves each capture's evidence class through replay. Its digest covers exactly the callback's bytes: retaining a projection does not retain the native body or prove native byte fidelity. The probe keeps the original native-body digest separately in its private receipt.
 
+`CompanyPageRuns` stores bounded run context, exact page requests and expiring owner tokens in the source Journal DB. Its stable page attempt survives reservation/reclaim and crash recovery. The NOS branch's opt-in `execute_leased_company_page` checks ownership under the physical source/delivery lock, validates returned paging before M2 admission and advances only from a matching committed delivery acknowledgement. Crash recovery or ambiguous delivery reuses the page/job without rereading the source. Short/empty/partial pages, unproved range boundaries and budget exhaustion keep source completeness unknown. The next relevance offset is a bounded candidate, not a complete-history cursor.
+
+Ownership guards are read-only; callbacks must not reenter Journal/run writes. Durable acknowledgement receipts support cursor checkpoints, not automatic delivery retries or a distributed outbox. A source admission followed by owner loss can remain `dispatch_unknown` even if the guard prevented transport; recovery does not invent a safe resend.
+
 ## Install and test
 
 Use Python 3.11 or later. Verification was run locally on Python 3.12.
