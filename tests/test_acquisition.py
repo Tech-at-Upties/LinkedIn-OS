@@ -297,6 +297,29 @@ def test_replay_cannot_change_original_evidence_class(tmp_path):
     assert calls == [1]
 
 
+def test_projected_capture_keeps_class_digest_and_cannot_replay_as_native(tmp_path):
+    path = tmp_path / 'projection.sqlite'
+    calls = []
+    selected = permission(evidence_class='allowlisted_source_projection')
+    first = run(Journal(path), lambda: calls.append(1) or response(), permission=selected)
+    replay = run(Journal(path), lambda: calls.append(1) or response(), permission=selected)
+    assert replay.replayed and replay.body_sha256 == first.body_sha256
+    assert all(item.evidence_class == 'allowlisted_source_projection' for item in replay.page.publications)
+    assert Journal(path).read(first.attempt_id, NOW)['evidence_class'] == 'allowlisted_source_projection'
+    with pytest.raises(AcquisitionFailure, match='attempt_identity_conflict'):
+        run(Journal(path), lambda: calls.append(1) or response(),
+            permission=permission(evidence_class='native_response'))
+    assert calls == [1]
+
+
+def test_unknown_evidence_class_is_rejected_before_dispatch(tmp_path):
+    calls = []
+    with pytest.raises(AcquisitionFailure, match='evidence_class'):
+        run(Journal(tmp_path / 'unknown.sqlite'), lambda: calls.append(1) or response(),
+            permission=permission(evidence_class='unknown'))
+    assert calls == []
+
+
 def test_legacy_receipt_stays_readable_without_guessing_feed_context(tmp_path):
     path = tmp_path / "journal.sqlite"
     calls = []

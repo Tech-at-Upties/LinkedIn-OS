@@ -2,7 +2,7 @@
 
 Standalone LinkedIn parsing and evidence components for NOS. This is the primary development repository. NOS integration lives on [`feat/linkedin-m1` in NOS-V1](https://github.com/Tech-at-Upties/NOS-V1/tree/feat/linkedin-m1).
 
-The current implementation includes conservative normalized company-feed parsing, source-specific wire serialization, and a permission-gated original-byte journal with expiry, replay and durable stop handling. It does not register a live collector or recurring workload.
+The current implementation includes conservative normalized company-feed parsing, source-specific wire serialization, and a original-byte journal with explicit collection/retention flags with expiry, replay and durable stop handling. It does not register a live collector or recurring workload.
 
 Attempt admission is committed before transport runs. If the process exits before a response is committed, replay returns `dispatch_unknown` and never resends that attempt. This includes a possible crash before any request was sent: the journal cannot distinguish it from a transmitted request whose response was lost. Transport failures and invalid or oversized responses also retain a durable attempt outcome. These states do not establish source absence or successful collection.
 
@@ -11,6 +11,8 @@ Saved responses must be classified before another attempt can dispatch on the so
 The NOS branch's opt-in `xingestion.linkedin.executor.execute_company_page` connects one owned source callback to the M1 serializer and a validated M2 admission callback. It uses the source attempt ID as the stable job identity. The Journal checks the source fence, pending classification and expiry around physical delivery; a committed stop suppresses delivery, while a stop arriving during delivery waits for that callback. Explicit replay after an ambiguous delivery can deduplicate in M2 without rereading the source. The callback must acknowledge validated admission or raise. Task/queue registration and a durable delivery outbox remain open.
 
 Delivery callbacks must use a separate destination database and must not reenter the Journal to write. The guard serializes local callback invocation; it cannot cancel a transmitted write or prove that a remote write will not commit later after a timeout. Full runtime/canonical quarantine remains unverified.
+
+The Journal can retain native responses, allowlisted source projections and synthetic fixtures. It preserves each capture's evidence class through replay. Its digest covers exactly the callback's bytes: retaining a projection does not retain the native body or prove native byte fidelity. The probe keeps the original native-body digest separately in its private receipt.
 
 ## Install and test
 
@@ -41,8 +43,8 @@ For controlled NOS integration, check out its `feat/linkedin-m1` branch separate
 
 ## Access and current limits
 
-Collection and retention require an established permitted route. A browser login alone does not establish that permission. [LinkedIn's current website automation guidance](https://www.linkedin.com/help/linkedin/answer/a1341387/prohibited-software-and-extensions) restricts automated collection; [official organization post reads](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api?view=li-lms-2026-06) require appropriate API permissions and page roles.
+The native browser experiment uses a dedicated local session, one company page, at most one continuation and a cap of 12 scoped native reads. It blocks non-read requests and stops on challenge/restriction. It checks the landed page before continuation and preserves each run in a unique allowlisted receipt. Session profiles, credentials, source receipts and local controller instructions are excluded from publication.
 
-The native browser probe refuses before launch without a confirmed, unexpired permission record for its exact route and target. Do not create that record to bypass the access requirement. Session profiles, credentials, source receipts and local controller instructions are excluded from this repository.
+The opt-in local experiment `docs/experiments/execute_bounded_company_read.py` connects one current first-page capture to the actual M1 executor and local M2 SQLite admission, then checks restart replay without another browser launch. It uses exact source collection roots and explicitly retains a projection. `verify_projected_company_boundary.py` checks older private projections without network requests. Both need the NOS integration checkout at `.local/nos-integration`; browser reads also need its dedicated local Chrome session and existing Playwright installation in the sibling NOS checkout. Offline probe contract checks run with `node --test tests/test_probe_contract.cjs`.
 
 Current gaps include recipe-specific termination, production transport/access/retention, task/session registration, Redis delivery/canonical fencing, live error precision and sustained workload measurement. The SQLite dispatch primitive serializes stop commits with an in-flight call; it does not cancel a transmitted request or satisfy the full NOS runtime fence by itself.

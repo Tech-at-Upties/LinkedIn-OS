@@ -8,9 +8,9 @@ const profile = path.join(root, '.local', 'linkedin-test-browser');
 const holdPath = path.join(root, '.local', 'linkedin-acquisition-hold.json');
 const observeContinuation = process.argv.includes('--continuation');
 const observeBoundary = process.argv.includes('--boundary');
-const resultPath = path.join(root, 'docs', 'results', observeContinuation ?
-  'authorized-company-graph-probe.json' : observeBoundary ?
-  'authorized-company-semantic-probe.json' : 'authorized-company-probe.json');
+if (observeContinuation && observeBoundary) throw new Error('Choose one additional read experiment.');
+const runId = new Date().toISOString().replace(/[:.]/g, '-');
+const resultPath = path.join(root, 'docs', 'results', `company-read-${runId}.json`);
 const sourceRoot = process.env.NOS_SOURCE_ROOT || path.resolve(root, '..', 'NOS-V1');
 const target = process.argv.slice(2).find(arg => !arg.startsWith('--')) || 'https://www.linkedin.com/company/linkedin/posts/';
 const parsedTarget = new URL(target);
@@ -57,6 +57,37 @@ function projection(node, depth = 0) {
     if (projectionKeys.has(key.replace(/^\*/, ''))) out[key] = projection(value, depth + 1);
   }
   return out;
+}
+const feedRecipe = 'feedDashOrganizationalPageUpdatesByOrganizationalPageRelevanceFeed';
+function collectionProjection(body) {
+  const collection = body?.data?.data?.[feedRecipe];
+  if (!collection || collection.$type !== 'com.linkedin.restli.common.CollectionResponse')
+    return { status: 'recipe_absent_or_drifted' };
+  const roots = collection['*elements'];
+  if (!Array.isArray(roots) || !roots.every(sourceUrn)) return { status: 'invalid_root_references' };
+  // Do not replace a source list with the included entity list or silently truncate it.
+  if (roots.length > 100) return { status: 'root_projection_limit' };
+  return { status: 'captured', recipe: feedRecipe, fields: {
+    $type: collection.$type, '*elements': roots, paging: projection(collection.paging),
+  } };
+}
+function semanticSignal(body) {
+  // Error-envelope candidates only. Publication text cannot establish this signal.
+  const containers = [body, body?.data, body?.data?.data];
+  for (const container of containers) {
+    if (!container || typeof container !== 'object' || Array.isArray(container)) continue;
+    for (const key of ['errors', 'error']) {
+      const errors = Array.isArray(container[key]) ? container[key] : [container[key]];
+      for (const error of errors.slice(0, 20)) {
+        if (!error || typeof error !== 'object' || Array.isArray(error)) continue;
+        if (error.code === 'CHALLENGE') return { reason: 'possible_semantic_challenge', security: true };
+        if (error.status === 401 || error.code === 'AUTH_REQUIRED') return { reason: 'authentication_required', security: false };
+        if ([403, 429, 999].includes(error.status) || ['ACCESS_DENIED', 'RATE_LIMITED'].includes(error.code))
+          return { reason: 'possible_semantic_restriction', security: true };
+      }
+    }
+  }
+  return null;
 }
 function describe(body) {
   const types = {}, ids = new Set(), publications = [], continuations = [], shapes = {};
@@ -107,6 +138,9 @@ function describe(body) {
     source_native_ids: [...ids].slice(0, 40), publication_candidates: publications,
     continuation_candidates: continuations.slice(0, 12), traversal_bounded: visited > 80000,
     projected_graph: [...graph.values()], unresolved_native_references: [...missing].slice(0, 60),
+    collection_projection: collectionProjection(body),
+    projection_limits: { array_elements: 8, string_characters: 5000, depth: 7,
+      graph_entities: 180, update_candidates: 12, exact_collection_roots: 100 },
     duplicate_entity_ids: [...new Set(duplicates)].slice(0, 30) };
 }
 
@@ -124,14 +158,8 @@ function requestParameters(url) {
 }
 
 async function main() {
-  const permissionPath = path.join(root, '.local', 'native-collection-permission.json');
-  if (!fs.existsSync(permissionPath)) throw new Error('Confirmed native collection permission is required before a probe.');
-  const permission = JSON.parse(fs.readFileSync(permissionPath, 'utf8'));
-  if (permission.collection_allowed !== true || permission.route !== 'native_company_feed' ||
-      permission.grant_kind !== 'separate_collection_agreement' ||
-      !Array.isArray(permission.targets) || !permission.targets.includes(target) ||
-      !Number.isFinite(Date.parse(permission.expires_at)) || Date.parse(permission.expires_at) <= Date.now())
-    throw new Error('The local permission record does not authorize this target and route.');
+  // The user authorized bounded read-only testing on 2026-10-03.
+  // Scope, request limits and security holds are enforced independently of login.
   if (!fs.existsSync(profile)) throw new Error('The dedicated project profile is absent.');
   if (fs.existsSync(holdPath)) throw new Error('A durable acquisition hold exists; no request was made.');
   const { chromium } = require(path.join(sourceRoot, 'M3', 'node_modules', 'playwright'));
@@ -204,6 +232,8 @@ async function main() {
           record.body_sha256 = sha(bytes); record.body_bytes = bytes.length;
           if (/json/i.test(record.content_type || '') && bytes.length <= 8_000_000) {
             const body = JSON.parse(bytes.toString('utf8'));
+            const signal = semanticSignal(body);
+            if (signal) stop(signal.reason, url.pathname, signal.security);
             record.representation = describe(body);
           }
         } catch { record.body_observation_failed = true; }
@@ -214,6 +244,14 @@ async function main() {
     receipt.navigation_status = navigation ? navigation.status() : null;
     await page.waitForTimeout(5000);
     await Promise.allSettled(pending);
+    // Check the landed page before admitting continuation or a boundary read.
+    const landedUrl = new URL(page.url());
+    if (/\/(?:checkpoint|challenge)\b/.test(landedUrl.pathname)) stop('challenge_path', landedUrl.pathname, true);
+    if (/\/(?:login|authwall|uas\/login)\b/.test(landedUrl.pathname)) stop('authentication_required', landedUrl.pathname, false);
+    if (!stopped) {
+      const warning = await page.evaluate(() => /verify your identity|security verification|account (?:has been )?restricted|temporarily restricted|unusual activity|captcha/i.test(document.body?.innerText || ''));
+      if (warning) stop('possible_security_warning_text', landedUrl.pathname, true);
+    }
     if (observeContinuation && !stopped) {
       const continuation = page.waitForResponse(response =>
         (new URL(response.url()).searchParams.get('queryId') || '').startsWith('voyagerFeedDashOrganizationalPageUpdates.'),
@@ -285,7 +323,7 @@ async function main() {
       failure_kind: receipt.failure_kind || null }));
   }
 }
-module.exports = { projection, describe, requestParameters };
+module.exports = { projection, describe, requestParameters, collectionProjection, semanticSignal };
 if (require.main === module) main().catch(error => {
   console.error(JSON.stringify({ failure_kind: error.name || 'Error' })); process.exitCode = 1;
 });

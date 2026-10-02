@@ -1,4 +1,4 @@
-"""One-attempt, explicitly permitted response capture with durable stop state.
+"""One-attempt response capture with explicit retention and durable stop state.
 
 No browser/API session recipe or automatic live collector is implemented here.
 SQLite serialization is an isolated primitive, not the NOS Postgres fence gate.
@@ -17,7 +17,7 @@ from typing import Callable
 from uuid import uuid4
 
 from .models import ParsedPage
-from .parser import native_id, parse_company_feed
+from .parser import EVIDENCE_CLASSES, native_id, parse_company_feed
 
 
 class AcquisitionFailure(RuntimeError):
@@ -146,8 +146,8 @@ class Journal:
         expires = _time(permission.raw_expires_at)
         if expires <= _time(now):
             raise AcquisitionFailure("retention_policy_expired")
-        if permission.evidence_class not in {"native_response", "synthetic_fixture"}:
-            raise AcquisitionFailure("original_bytes_evidence_class_required")
+        if permission.evidence_class not in EVIDENCE_CLASSES:
+            raise AcquisitionFailure("invalid_evidence_class")
         with self.connect() as connection:
             # Commit admission before dispatch. A process death cannot erase
             # the attempt and cause replay to silently send it again.
