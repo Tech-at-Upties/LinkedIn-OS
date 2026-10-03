@@ -83,10 +83,15 @@ def test_saved_projection_bootstrap_real_m2_http(m2, tmp_path, monkeypatch, stor
     try:
         selected = build_linkedin_runtime(manifest_config(tmp_path, endpoint))
         assert selected.evidence_class == 'synthetic_fixture'
-        result = selected.deliver(wire())
+        # Keep legacy unrestricted transport probes on a separate synthetic
+        # identity. An existing unrestricted corpus cannot be upgraded safely.
+        transport_probe = wire()
+        transport_probe['items'][0]['item_id'] = 'urn:li:activity:999'
+        transport_probe['items'][0]['source_fields']['occurrence_id'] = 'urn:li:activity:999'
+        result = selected.deliver(transport_probe)
         assert result['receipts'][0]['duplicate_delivery'] is False
-        assert selected.deliver(wire())['receipts'][0]['duplicate_delivery'] is True
-        assert store.admit(convert(wire())[0]).duplicate_delivery
+        assert selected.deliver(transport_probe)['receipts'][0]['duplicate_delivery'] is True
+        assert store.admit(convert(transport_probe)[0]).duplicate_delivery
         selected.runs.create(run_id='bootstrapped-page', feed_publisher_id=COMPANY,
             evidence_class='synthetic_fixture', first_start=3, count=10, page_budget=1)
         lease = selected.runs.claim('bootstrapped-page', owner='actual-m1', now=datetime.now(UTC))
@@ -94,7 +99,7 @@ def test_saved_projection_bootstrap_real_m2_http(m2, tmp_path, monkeypatch, stor
             permission=RoutePermission(True, True, selected.expires_at, 'synthetic_fixture'),
             send=lambda selected_page: selected.send(LinkedInCompanyFeedInput(
                 'https://www.linkedin.com/company/linkedin/posts/', COMPANY), selected_page),
-            deliver=selected.deliver)
+            deliver=lambda batch: selected.deliver(selected._wire(batch, 'bootstrapped-page', lease.attempt_id, lease.ordinal)))
         assert result.delivery_outcome == 'delivery_acknowledged'
         assert selected.runs.summary('bootstrapped-page')['completed_pages'] == 1
         task = create(ledger)

@@ -28,7 +28,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $dataPath 'PG_VERSION'))) {
     & $initPath -D $dataPath -U nos_test -A trust --encoding=UTF8 --no-locale *> (Join-Path $expectedParent 'postgres-init.log')
     if ($LASTEXITCODE -ne 0) { throw 'Project-local initdb failed; inspect .local/postgres-init.log.' }
 }
-if (-not (Test-Path -LiteralPath (Join-Path $dataPath 'postmaster.pid'))) {
+& $controlPath status -D $dataPath *> (Join-Path $expectedParent 'postgres-status.log')
+if ($LASTEXITCODE -ne 0) {
     $arguments = @('start', '-D', $dataPath, '-l', (Join-Path $expectedParent 'postgres-server.log'), '-o', '"-p 15432 -h 127.0.0.1"', '-w')
     $process = Start-Process -FilePath $controlPath -ArgumentList $arguments -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $expectedParent 'postgres-start.log') `
