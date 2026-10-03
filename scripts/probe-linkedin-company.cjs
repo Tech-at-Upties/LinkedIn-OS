@@ -8,7 +8,9 @@ const profile = path.join(root, '.local', 'linkedin-test-browser');
 const holdPath = path.join(root, '.local', 'linkedin-acquisition-hold.json');
 const observeContinuation = process.argv.includes('--continuation');
 const observeBoundary = process.argv.includes('--boundary');
+const runtimeCapture = process.argv.includes('--runtime-capture');
 if (observeContinuation && observeBoundary) throw new Error('Choose one additional read experiment.');
+if (runtimeCapture && (observeContinuation || observeBoundary)) throw new Error('Runtime capture permits one first page only.');
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
 const resultPath = path.join(root, 'docs', 'results', `company-read-${runId}.json`);
 const sourceRoot = process.env.NOS_SOURCE_ROOT || path.resolve(root, '..', 'NOS-V1');
@@ -316,11 +318,19 @@ async function main() {
   } finally {
     if (context) await context.close();
     receipt.finished_at = new Date().toISOString();
-    fs.writeFileSync(resultPath, JSON.stringify(receipt, null, 2) + '\n');
-    console.log(JSON.stringify({ result: path.relative(root, resultPath),
-      session_verified: receipt.session_verified, stopped: receipt.stopped?.reason || null,
-      navigation_status: receipt.navigation_status, native_responses: receipt.responses.length,
-      failure_kind: receipt.failure_kind || null }));
+    if (runtimeCapture) {
+      // The runtime commits this projection to its expiring source Journal.
+      // Do not create another unrestricted publication/DOM receipt on disk.
+      delete receipt.dom;
+      const value = JSON.stringify(receipt);
+      console.log(Buffer.byteLength(value) <= 2_000_000 ? value : JSON.stringify({ failure_kind: 'ProjectionLimit' }));
+    } else {
+      fs.writeFileSync(resultPath, JSON.stringify(receipt, null, 2) + '\n');
+      console.log(JSON.stringify({ result: path.relative(root, resultPath),
+        session_verified: receipt.session_verified, stopped: receipt.stopped?.reason || null,
+        navigation_status: receipt.navigation_status, native_responses: receipt.responses.length,
+        failure_kind: receipt.failure_kind || null }));
+    }
   }
 }
 module.exports = { projection, describe, requestParameters, collectionProjection, semanticSignal };
