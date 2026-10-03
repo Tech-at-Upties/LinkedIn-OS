@@ -314,9 +314,14 @@ async function main() {
     receipt.unrelated_native_reads_blocked = scopedBlocked;
   } catch (error) {
     receipt.failure_kind = error.name || 'Error';
+    receipt.failure_stage = context ? 'navigation_or_capture' : 'browser_launch';
+    receipt.browser_install_not_found = !context && /executable.*doesn.t exist|distribution.*not found/i.test(error.message || '');
     // Browser error messages can contain full URLs. Do not log them or their stacks.
   } finally {
     if (context) await context.close();
+    receipt.native_reads_admitted = nativeReads;
+    receipt.native_request_candidates = nativeCandidates;
+    receipt.unrelated_native_reads_blocked = scopedBlocked;
     receipt.finished_at = new Date().toISOString();
     if (runtimeCapture) {
       // The runtime commits this projection to its expiring source Journal.

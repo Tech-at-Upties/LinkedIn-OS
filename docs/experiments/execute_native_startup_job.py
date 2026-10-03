@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import re
 import socket
 import subprocess
 import sys
@@ -56,11 +57,30 @@ def main():
             raise RuntimeError('unexpected_verification_cluster')
         if not connection.execute('SELECT 1 FROM pg_database WHERE datname=%s', (DATABASE,)).fetchone():
             connection.execute('CREATE DATABASE nos_linkedin_startup_jobs')
-    # Refuse another experiment rather than renewing a consumed allowance.
-    if (ROOT / '.local/linkedin-live-capture.sqlite').exists():
+    # Resume only a pre-dispatch harness failure with its unchanged declaration.
+    # Never replace/refund a consumed allowance or recreate source work.
+    resume = None
+    if len(sys.argv) == 3 and sys.argv[1] == '--resume':
+        receipt_path = Path(sys.argv[2]).resolve()
+        if not receipt_path.is_relative_to(ROOT / 'docs/results'):
+            raise ValueError('resume_receipt_outside_project')
+        resume = json.loads(receipt_path.read_text(encoding='utf-8'))
+        if not re.fullmatch(r'native-startup-[a-f0-9]{32}', resume['experiment_id']) or resume.get('root_job_id'):
+            raise ValueError('resume_requires_same_pre_dispatch_experiment')
+        import sqlite3
+        with sqlite3.connect(ROOT / '.local/linkedin-live-capture.sqlite') as connection:
+            if connection.execute('SELECT consumed_at FROM capture_allowance').fetchone()[0] is not None:
+                raise ValueError('consumed_allowance_cannot_resume_source')
+    elif len(sys.argv) != 1:
+        raise ValueError('unsupported_experiment_arguments')
+    if resume is None and (ROOT / '.local/linkedin-live-capture.sqlite').exists():
         raise RuntimeError('declared_profile_allowance_already_exists_do_not_reset')
-    experiment = 'native-startup-' + uuid4().hex
-    data = ROOT / '.local' / experiment; data.mkdir()
+    experiment = resume['experiment_id'] if resume else 'native-startup-' + uuid4().hex
+    data = ROOT / '.local' / experiment
+    if resume:
+        if not data.is_dir(): raise ValueError('original_experiment_directory_absent')
+    else:
+        data.mkdir()
     sink_path = data / 'm2.sqlite'
     token = secrets.token_urlsafe(32)
     previous = os.environ.get('LINKEDIN_M2_API_TOKEN')
@@ -81,12 +101,13 @@ def main():
         deadline = time.monotonic() + 5
         while not server.started and time.monotonic() < deadline: time.sleep(.01)
         if not server.started: raise RuntimeError('owned_m2_http_unavailable')
-        manifest = dict(company_url=TARGET, feed_publisher_id=COMPANY, feed_request_urn=REQUEST_URN,
+        path = data / 'live-manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8')) if resume else dict(company_url=TARGET, feed_publisher_id=COMPANY, feed_request_urn=REQUEST_URN,
             evidence_class='allowlisted_source_projection', capture_budget=1, native_read_budget=12,
             expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat(), project_root=str(ROOT),
             nos_source_root=str(ROOT.parent / 'NOS-V1'),
             probe_sha256=sha256((ROOT / 'scripts/probe-linkedin-company.cjs').read_bytes()).hexdigest())
-        path = data / 'live-manifest.json'; path.write_text(json.dumps(manifest), encoding='utf-8')
+        if resume is None: path.write_text(json.dumps(manifest), encoding='utf-8')
         stream = 'linkedin-native-startup:' + experiment
         config = replace(load_app_config(NOS / 'M1'), data_dir=data, sqlite_path=data / 'worker.sqlite',
             raw_evidence_dir=data / 'raw', secret_dir=data / 'secrets', session_registry_path=None,
@@ -102,8 +123,8 @@ def main():
         selected.ledger.pool.wait(5)
         PostgresMigrationRunner(selected.ledger.pool, NOS / 'M1/src/xingestion/migrations/postgres_sql').apply()
         with selected.ledger.pool.connection() as connection:
-            if connection.execute('SELECT COUNT(*) FROM capability_tasks WHERE state NOT IN (%s,%s)',
-                                  (TaskState.DONE.value, TaskState.DEAD_LETTER.value)).fetchone()[0]:
+            if connection.execute('SELECT COUNT(*) AS active FROM capability_tasks WHERE state NOT IN (%s,%s)',
+                                  (TaskState.DONE.value, TaskState.DEAD_LETTER.value)).fetchone()['active']:
                 raise RuntimeError('another_owned_startup_task_is_active')
         queued = queue_capability_request(ledger=selected.ledger, planner=CapabilityPlanner(None),
             capability_request=CapabilityRequest(CapabilityId.LINKEDIN_COMPANY_FEED, 1,
@@ -155,7 +176,8 @@ def main():
             'Projected bytes; distinct discarded native-body digest',
             'Configured factory/actual Redis/M2 HTTP; reconstruction is same-process resource reopen',
             'Retention ingress_only; derived analysis disabled; no allowance reset']
-        (ROOT / 'docs/results' / (experiment + '.json')).write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+        suffix = '-resume-' + uuid4().hex if resume else ''
+        (ROOT / 'docs/results' / (experiment + suffix + '.json')).write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
 
 
 if __name__ == '__main__':

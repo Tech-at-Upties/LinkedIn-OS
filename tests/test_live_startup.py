@@ -90,6 +90,7 @@ def test_single_capture_survives_reopen_and_different_journal(tmp_path, monkeypa
     assert calls[0][0][-1] == '--runtime-capture' and '--continuation' not in calls[0][0]
     assert calls[0][1]['timeout'] == 85 and calls[0][1]['stderr'] is not None
     assert not {'LINKEDIN_M2_API_TOKEN', 'OPENAI_API_KEY', 'DEBUG'} & calls[0][1]['env'].keys()
+    assert all(key in calls[0][1]['env'] for key in os.environ if key.upper() in {'PROGRAMFILES', 'PROGRAMFILES(X86)'})
     reopened = BoundedBrowserCapture(value)
     with pytest.raises(ValueError, match='already consumed'):
         invoke(reopened, 'different-source-attempt')
