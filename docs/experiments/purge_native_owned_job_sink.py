@@ -34,7 +34,10 @@ try:
         'original_expires_at': receipt['projection_expires_at'], 'newly_purged_evidence': count,
         'erased_envelope_copies': 40, 'metadata_receipts_preserved': True, 'network_reads': 0,
         'limits': 'Application envelopes only; private research receipts, backups and physical database remnants are separate.'}
-    (ROOT / 'docs/results/native-owned-job-sink-expiry.json').write_text(json.dumps(report, indent=2) + '\n')
+    output = ROOT / 'docs/results/native-owned-job-sink-expiry.json'
+    if output.exists():
+        output = output.with_name(output.stem + '-' + datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ') + '.json')
+    output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))
 finally:
     store.close()

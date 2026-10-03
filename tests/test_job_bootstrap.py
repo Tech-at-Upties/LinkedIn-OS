@@ -143,6 +143,13 @@ def test_sink_does_not_follow_redirect_or_accept_wrong_ack(tmp_path, monkeypatch
     destinations = []
     class Receiver(BaseHTTPRequestHandler):
         def do_POST(self):
+            if self.path == '/v1/linkedin/source-fence':
+                body = self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path != '/v1/linkedin/results':
                 destinations.append(self.path)
             if mode == 'redirect':
