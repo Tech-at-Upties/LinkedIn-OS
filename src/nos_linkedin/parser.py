@@ -111,14 +111,14 @@ def _counts(graph: _Graph, update: Mapping[str, Any], occurrence_id: str, conten
     targets = {occurrence_id}
     if content.state == FieldState.value:
         targets.add(content.value)
-    if target not in targets:
+    if not isinstance(target, str) or target not in targets:
         graph.issues.append(Issue("metric_target_mismatch", counts.get("entityUrn")))
         return unknown
     values = {key: _field(counts, key, lambda value: type(value) is int and value >= 0) for key in metric_fields}
     for key, value in values.items():
         if value.state == FieldState.invalid:
             graph.issues.append(Issue("invalid_metric", counts["entityUrn"], key))
-    reactions: list[tuple[str, int]] = []
+    reactions: dict[str, int] = {}
     seen: set[str] = set()
     reaction_list = counts.get("reactionTypeCounts", [])
     if not isinstance(reaction_list, list):
@@ -129,12 +129,20 @@ def _counts(graph: _Graph, update: Mapping[str, Any], occurrence_id: str, conten
                 graph.issues.append(Issue("invalid_reaction_type", counts["entityUrn"]))
                 continue
             kind, count = item.get("reactionType"), item.get("count")
-            if not isinstance(kind, str) or not re.fullmatch(r"[A-Z_]{1,50}", kind) or type(count) is not int or count < 0 or kind in seen:
+            if not isinstance(kind, str) or not re.fullmatch(r"[A-Z_]{1,50}", kind):
+                graph.issues.append(Issue("invalid_reaction_type", counts["entityUrn"]))
+                continue
+            if kind in seen:
+                # Repeated kinds cannot establish a unique count, even when equal.
+                reactions.pop(kind, None)
                 graph.issues.append(Issue("invalid_reaction_type", counts["entityUrn"]))
                 continue
             seen.add(kind)
-            reactions.append((kind, count))
-    return Metrics(target, counts["entityUrn"], values, tuple(reactions))
+            if type(count) is not int or count < 0:
+                graph.issues.append(Issue("invalid_reaction_type", counts["entityUrn"]))
+                continue
+            reactions[kind] = count
+    return Metrics(target, counts["entityUrn"], values, tuple(reactions.items()))
 
 
 def parse_graph(
@@ -169,8 +177,8 @@ def parse_graph(
             continue
         occurrence_id = metadata["backendUrn"]
         content = _field(metadata, "shareUrn", lambda value: isinstance(value, str) and bool(_PUBLICATION.fullmatch(value)))
-        actor = root.get("actor")
-        actor_id = _field(actor, "backendUrn", native_id) if isinstance(actor, Mapping) else SourceField(FieldState.missing)
+        actor = _field(root, "actor", lambda value: isinstance(value, Mapping))
+        actor_id = _field(actor.value, "backendUrn", native_id) if actor.state == FieldState.value else actor
         if actor_id.state != FieldState.value:
             graph.issues.append(Issue("unknown_actor", identifier))
         reshared = SourceField(FieldState.missing)

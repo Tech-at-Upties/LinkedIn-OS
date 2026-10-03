@@ -52,6 +52,41 @@ def test_missing_null_zero_remain_distinct():
     assert values["numShares"].state == FieldState.missing
 
 
+@pytest.mark.parametrize("actor,state", [(None, FieldState.null), ([], FieldState.invalid), ("unknown", FieldState.invalid)])
+def test_actor_container_preserves_null_and_invalid_states(actor, state):
+    nodes = fixture()
+    nodes[0]["actor"] = actor
+    result = parse(nodes)
+    assert result.publications[0].actor_id.state == state
+    assert result.publications[0].actor_id.value is None
+    assert "unknown_actor" in {issue.code for issue in result.issues}
+
+
+@pytest.mark.parametrize("target", [[], {}, ["urn:li:ugcPost:456"]])
+def test_malformed_metric_target_is_unknown_without_crashing(target):
+    nodes = fixture()
+    nodes[2]["urn"] = target
+    result = parse(nodes)
+    assert result.publications[0].metrics.target_id is None
+    assert all(value.state == FieldState.missing for value in result.publications[0].metrics.values.values())
+    assert "metric_target_mismatch" in {issue.code for issue in result.issues}
+
+
+@pytest.mark.parametrize("counts", [(3, 999), (999, 3), (3, 3), (3, None), (None, 3), (3, True), ("3", 3)])
+def test_duplicate_reaction_kind_never_selects_first_count(counts):
+    nodes = fixture()
+    nodes[2]["reactionTypeCounts"] = [
+        {"reactionType": "LIKE", "count": counts[0]},
+        {"reactionType": "PRAISE", "count": 2},
+        {"reactionType": "LIKE", "count": counts[1]},
+        {"reactionType": "LIKE", "count": 8},
+    ]
+    result = parse(nodes)
+    assert result.publications[0].metrics.reaction_types == (("PRAISE", 2),)
+    assert result.publications[0].metrics.values["numLikes"].value == 5
+    assert "invalid_reaction_type" in {issue.code for issue in result.issues}
+
+
 @pytest.mark.parametrize("bad", [True, -1, 1.5, "0"])
 def test_invalid_counts_are_unknown_with_issue(bad):
     nodes = fixture()
@@ -116,6 +151,71 @@ def test_explicit_reshare_preserves_own_commentary_without_merging_original_text
     item = parse(nodes + [original]).publications[0]
     assert item.reshared_occurrence_id.value == "urn:li:activity:987"
     assert item.commentary.value == "Own commentary"
+
+
+@pytest.mark.parametrize("actor,state", [({}, FieldState.missing), ({"backendUrn": None}, FieldState.null),
+                                          ({"backendUrn": []}, FieldState.invalid)])
+def test_actor_identity_states_never_fall_back_to_feed_publisher(actor, state):
+    nodes = fixture()
+    nodes[0]["actor"] = actor
+    item = parse(nodes).publications[0]
+    assert item.actor_id.state == state
+    assert item.actor_id.value is None
+    assert item.feed_publisher_id == COMPANY
+
+
+def test_absent_actor_never_adopts_feed_publisher():
+    nodes = fixture()
+    del nodes[0]["actor"]
+    assert parse(nodes).publications[0].actor_id.state == FieldState.missing
+
+
+@pytest.mark.parametrize("commentary,state", [(None, FieldState.null), ({}, FieldState.missing), ([], FieldState.invalid)])
+def test_embedded_original_and_header_do_not_replace_own_commentary(commentary, state):
+    nodes = fixture()
+    original = copy.deepcopy(nodes[0])
+    original["entityUrn"] = "urn:li:fsd_update:(urn:li:activity:987,ORIGINAL)"
+    original["metadata"]["backendUrn"] = "urn:li:activity:987"
+    original["actor"]["backendUrn"] = "urn:li:company:555"
+    original["commentary"]["text"]["text"] = "Original text"
+    nodes[0]["commentary"] = commentary
+    nodes[0]["resharedUpdate"] = original["entityUrn"]
+    item = parse(nodes + [original]).publications[0]
+    assert item.commentary.state == state
+    assert item.commentary.value is None
+    assert item.actor_id.value == "urn:li:company:999"
+    assert item.reshared_occurrence_id.value == "urn:li:activity:987"
+
+
+def test_header_repost_label_does_not_establish_a_reshare_reference():
+    nodes = fixture()
+    del nodes[0]["resharedUpdate"]
+    nodes[0]["header"]["text"]["text"] = "Company reposted this"
+    item = parse(nodes).publications[0]
+    assert item.header_text.value == "Company reposted this"
+    assert item.reshared_occurrence_id.state == FieldState.missing
+
+
+@pytest.mark.parametrize("variant", ["missing", "wrong_type", "conflict", "self"])
+def test_unresolved_original_never_fabricates_reshare_identity(variant):
+    nodes = fixture()
+    original = copy.deepcopy(nodes[0])
+    original["entityUrn"] = "urn:li:fsd_update:(urn:li:activity:987,ORIGINAL)"
+    original["metadata"]["backendUrn"] = "urn:li:activity:987"
+    nodes[0]["resharedUpdate"] = original["entityUrn"]
+    if variant == "wrong_type":
+        original["$type"] = SOCIAL
+    elif variant == "self":
+        original["metadata"]["backendUrn"] = nodes[0]["metadata"]["backendUrn"]
+    if variant != "missing":
+        nodes.append(original)
+    if variant == "conflict":
+        conflict = copy.deepcopy(original)
+        conflict["metadata"]["backendUrn"] = "urn:li:activity:789"
+        nodes.append(conflict)
+    result = parse(nodes)
+    assert result.publications[0].reshared_occurrence_id.state == FieldState.invalid
+    assert "unresolved_reshare" in {issue.code for issue in result.issues}
 
 
 def test_naive_observation_time_is_rejected():

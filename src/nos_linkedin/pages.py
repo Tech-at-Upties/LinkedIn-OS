@@ -183,6 +183,8 @@ class CompanyPageRuns:
                 state = 'empty_page'
             elif len(page.publications) < lease.count:
                 state = 'short_page'
+            elif len(page.publications) > lease.count:
+                state = 'overfull_page'
             elif run['completed_pages'] + 1 >= run['page_budget']:
                 state = 'budget_exhausted'
             elif next_start >= page.paging['total']:

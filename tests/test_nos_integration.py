@@ -74,6 +74,79 @@ def test_actual_boundary_keeps_native_identity_authorship_metrics_and_origin(sto
     assert store.get_evidence(receipt.evidence_id)["origin"]["m1_job_id"] == "job-li-1"
 
 
+@pytest.mark.parametrize("actor,state", [(None, "null"), ([], "invalid")], ids=["null", "invalid"])
+def test_repaired_actor_container_state_survives_actual_boundary(store, actor, state):
+    nodes = fixture()
+    nodes[0]["actor"] = actor
+    result = wire(nodes)
+    envelope = convert(result)[0]
+    assert envelope.author is None
+    receipt = store.admit(envelope)
+    saved = store.get_evidence(receipt.evidence_id)
+    item = saved["raw_payload"]["m1_item"]
+    assert saved["author"] is None and item["author"] is None
+    assert item["source_fields"]["actor_id"] == {"state": state, "value": None}
+    assert item["source_fields"]["feed_publisher_id"] == COMPANY
+    assert saved["metrics"] == {"numLikes": 5, "numComments": 0, "numImpressions": None}
+    observation = store.list_observations(receipt.evidence_id)[0]
+    assert observation["raw_payload"]["m1_item"]["source_fields"]["actor_id"] == {"state": state, "value": None}
+    forged = copy.deepcopy(result)
+    forged["items"][0]["author"] = {"account_id": COMPANY}
+    with pytest.raises(M1Error):
+        convert(forged)
+
+
+@pytest.mark.parametrize("target", [[], {}], ids=["list", "object"])
+def test_malformed_metric_target_stays_unknown_in_actual_boundary(store, target):
+    nodes = fixture()
+    nodes[2]["urn"] = target
+    result = wire(nodes)
+    envelope = convert(result)[0]
+    assert envelope.metrics == {}
+    receipt = store.admit(envelope)
+    saved = store.get_evidence(receipt.evidence_id)
+    item = saved["raw_payload"]["m1_item"]
+    metrics = item["source_fields"]["metrics"]
+    assert saved["metrics"] == {} and item["metrics"] == {}
+    assert item["metrics_target_id"] is None and metrics["target_id"] is None
+    assert metrics["values"] == {key: {"state": "missing", "value": None}
+                                 for key in ("numLikes", "numComments", "numShares", "numImpressions")}
+    assert "metric_target_mismatch" in {gap["code"] for gap in item["coverage"]["gaps"]}
+    observation = store.list_observations(receipt.evidence_id)[0]
+    assert observation["metrics"] == {}
+    assert observation["raw_payload"]["m1_item"]["source_fields"]["metrics"] == metrics
+    forged = copy.deepcopy(result)
+    forged["items"][0]["metrics"] = {"numLikes": 0}
+    with pytest.raises(M1Error):
+        convert(forged)
+
+
+@pytest.mark.parametrize("counts", [(3, 999), (999, 3)], ids=["low-first", "high-first"])
+def test_ambiguous_reaction_kind_preserves_native_aggregate_in_actual_boundary(store, counts):
+    nodes = fixture()
+    nodes[2]["reactionTypeCounts"] = [
+        {"reactionType": "LIKE", "count": counts[0]},
+        {"reactionType": "PRAISE", "count": 2},
+        {"reactionType": "LIKE", "count": counts[1]},
+    ]
+    envelope = convert(wire(nodes))[0]
+    receipt = store.admit(envelope)
+    saved = store.get_evidence(receipt.evidence_id)
+    item = saved["raw_payload"]["m1_item"]
+    metrics = item["source_fields"]["metrics"]
+    assert saved["metrics"] == {"numLikes": 5, "numComments": 0, "numImpressions": None}
+    assert metrics["target_id"] == item["metrics_target_id"] == "urn:li:ugcPost:456"
+    assert metrics["reaction_types"] == [["PRAISE", 2]]
+    assert metrics["values"]["numLikes"] == {"state": "value", "value": 5}
+    assert metrics["values"]["numComments"] == {"state": "value", "value": 0}
+    assert metrics["values"]["numImpressions"] == {"state": "null", "value": None}
+    assert metrics["values"]["numShares"] == {"state": "missing", "value": None}
+    assert "invalid_reaction_type" in {gap["code"] for gap in item["coverage"]["gaps"]}
+    observation = store.list_observations(receipt.evidence_id)[0]
+    assert observation["metrics"] == saved["metrics"]
+    assert observation["raw_payload"]["m1_item"]["source_fields"]["metrics"] == metrics
+
+
 def test_duplicate_repeat_engagement_change_and_edit_have_separate_history(store):
     initial = convert(wire())[0]
     first = store.admit(initial)

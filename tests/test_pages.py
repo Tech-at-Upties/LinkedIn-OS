@@ -185,6 +185,24 @@ def test_checkpoint_cannot_invent_ack_or_advance_after_retention_expiry(tmp_path
     assert runs.summary('run-one')['completed_pages'] == 0
 
 
+def test_overfull_page_pauses_without_claiming_offset_or_completeness(tmp_path):
+    _, runs, permission = setup(tmp_path, count=1, budget=3)
+    lease = runs.claim('run-one', owner='first', now=NOW)
+    def overfull(body):
+        from copy import deepcopy
+        extra = deepcopy(body['included'][0])
+        extra['entityUrn'] = 'urn:li:fsd_update:(urn:li:activity:124,COMPANY_FEED_RELEVANCE)'
+        extra['metadata']['backendUrn'] = 'urn:li:activity:124'
+        body['included'].append(extra)
+        body['data']['data'][RECIPE]['*elements'].append(extra['entityUrn'])
+    result = execute(runs, lease, permission, [], lambda wire: None, mutate=overfull)
+    assert result.delivery_outcome == 'delivery_acknowledged'
+    summary = runs.summary('run-one')
+    assert summary['state'] == 'overfull_page'
+    assert summary['completed_pages'] == 1 and summary['source_complete'] is None
+    assert runs.claim('run-one', owner='next', now=NOW) is None
+
+
 def test_source_stop_prevents_new_claim_and_access_failure_does_not_advance(tmp_path):
     journal, runs, permission = setup(tmp_path)
     lease = runs.claim('run-one', owner='first', now=NOW)
