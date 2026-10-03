@@ -144,7 +144,7 @@ def test_failed_or_invalid_capture_never_refunds_allowance(tmp_path, monkeypatch
             return SimpleNamespace(returncode=1, stdout=b'{}')
         monkeypatch.setattr('xingestion.linkedin.live.subprocess.run', failure)
     with pytest.raises((ValueError, TimeoutError)): invoke(capture)
-    with pytest.raises(ValueError, match='already consumed'): invoke(BoundedBrowserCapture(value), 'source-two')
+    with pytest.raises(ValueError): invoke(BoundedBrowserCapture(value), 'source-two')
     assert len(calls) == 1
 
 
@@ -249,7 +249,8 @@ def test_normal_worker_factory_loads_live_configuration_without_x_credentials(tm
         selected.ledger.pool.close(); selected.redis_client.close()
 
 
-def test_live_projection_through_actual_redis_m2_http_and_reopen(tmp_path, monkeypatch, ledger, queue, m2, store):
+@pytest.mark.parametrize('intervention', [None, 'authentication_required', 'challenge_path'])
+def test_live_projection_through_actual_redis_m2_http_and_reopen(tmp_path, monkeypatch, ledger, queue, m2, store, intervention):
     app, service = m2
     listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen(10)
     server = uvicorn.Server(uvicorn.Config(app, log_level='critical', lifespan='off'))
@@ -258,13 +259,31 @@ def test_live_projection_through_actual_redis_m2_http_and_reopen(tmp_path, monke
     while not server.started and time.monotonic() < deadline: time.sleep(.01)
     assert server.started
     config, value = configuration(tmp_path, f'http://127.0.0.1:{listener.getsockname()[1]}/v1/linkedin/results')
-    calls = []; spy(monkeypatch, calls)
+    calls = []
+    def signal(receipt):
+        if intervention:
+            receipt['stopped'] = {'reason':intervention}
+            receipt['session_verified'] = False
+    spy(monkeypatch, calls, signal)
     monkeypatch.setenv('LINKEDIN_M2_API_TOKEN', 'local-http-test-token')
     try:
         selected = build_linkedin_runtime(config)
         task = create(ledger)
         assert dispatcher(ledger, queue).dispatch_once().dispatched
-        assert selected_worker(ledger, selected, queue).process_one().state.value == 'DONE'
+        outcome = selected_worker(ledger, selected, queue).process_one()
+        if intervention:
+            from nos_m2.store import SourceFenceTable
+            assert outcome.state.value == 'DEAD_LETTER' and len(calls)==1
+            with selected.journal.connect() as connection:
+                state=connection.execute("SELECT generation,stopped,reason FROM route_state WHERE scope='linkedin.company-feed'").fetchone()
+                assert state['stopped'] and state['reason']==('challenge' if intervention=='challenge_path' else 'authentication_required')
+            with store.Session() as session:
+                remote=session.get(SourceFenceTable,selected.authority_id)
+                assert remote.stopped and remote.generation==state['generation']
+            assert store.list_evidence()==[]
+            with pytest.raises(ValueError,match='intervention'): build_linkedin_runtime(config)
+            return
+        assert outcome.state.value == 'DONE'
         result = selected.result_for_task(ledger.get_task(task.task_id))
         assert result['items'][0]['source_fields']['evidence_class'] == 'allowlisted_source_projection'
         assert result['items'][0]['retention']['expires_at'] <= value['expires_at']

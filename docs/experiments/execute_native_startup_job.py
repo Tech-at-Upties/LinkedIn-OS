@@ -60,7 +60,22 @@ def main():
     # Resume only a pre-dispatch harness failure with its unchanged declaration.
     # Never replace/refund a consumed allowance or recreate source work.
     resume = None
-    if len(sys.argv) == 3 and sys.argv[1] == '--resume':
+    declared_path = None
+    if len(sys.argv) == 3 and sys.argv[1] == '--declared-manifest':
+        declared_path = Path(sys.argv[2]).resolve()
+        if (not declared_path.is_relative_to(ROOT / '.local') or not declared_path.is_file()
+                or declared_path.name == 'live-manifest.json'):
+            raise ValueError('explicit_successor_manifest_required')
+        declaration = json.loads(declared_path.read_text(encoding='utf-8'))
+        if Path(declaration['source_journal']).resolve().parent != declared_path.parent:
+            raise ValueError('successor_must_retain_original_source_directory')
+        import sqlite3
+        digest = sha256(json.dumps(declaration, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        with sqlite3.connect(ROOT / '.local/linkedin-live-capture.sqlite') as connection:
+            row = connection.execute('SELECT declaration_sha, consumed_at FROM capture_allowance').fetchone()
+            if row != (digest, None):
+                raise ValueError('explicit_unconsumed_successor_declaration_required')
+    elif len(sys.argv) == 3 and sys.argv[1] == '--resume':
         receipt_path = Path(sys.argv[2]).resolve()
         if not receipt_path.is_relative_to(ROOT / 'docs/results'):
             raise ValueError('resume_receipt_outside_project')
@@ -73,11 +88,11 @@ def main():
                 raise ValueError('consumed_allowance_cannot_resume_source')
     elif len(sys.argv) != 1:
         raise ValueError('unsupported_experiment_arguments')
-    if resume is None and (ROOT / '.local/linkedin-live-capture.sqlite').exists():
+    if resume is None and declared_path is None and (ROOT / '.local/linkedin-live-capture.sqlite').exists():
         raise RuntimeError('declared_profile_allowance_already_exists_do_not_reset')
     experiment = resume['experiment_id'] if resume else 'native-startup-' + uuid4().hex
-    data = ROOT / '.local' / experiment
-    if resume:
+    data = declared_path.parent if declared_path else ROOT / '.local' / experiment
+    if resume or declared_path:
         if not data.is_dir(): raise ValueError('original_experiment_directory_absent')
     else:
         data.mkdir()
@@ -96,18 +111,18 @@ def main():
     try:
         listener.bind(('127.0.0.1', 0)); listener.listen(10)
         endpoint = f'http://127.0.0.1:{listener.getsockname()[1]}/v1/linkedin/results'
-        server = uvicorn.Server(uvicorn.Config(create_app(service=service), log_level='critical', lifespan='off'))
+        server = uvicorn.Server(uvicorn.Config(create_app(service=service), log_level='critical', lifespan='auto'))
         thread = Thread(target=server.run, kwargs={'sockets': [listener]}, daemon=True); thread.start()
         deadline = time.monotonic() + 5
         while not server.started and time.monotonic() < deadline: time.sleep(.01)
         if not server.started: raise RuntimeError('owned_m2_http_unavailable')
-        path = data / 'live-manifest.json'
-        manifest = json.loads(path.read_text(encoding='utf-8')) if resume else dict(company_url=TARGET, feed_publisher_id=COMPANY, feed_request_urn=REQUEST_URN,
+        path = declared_path or data / 'live-manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8')) if resume or declared_path else dict(company_url=TARGET, feed_publisher_id=COMPANY, feed_request_urn=REQUEST_URN,
             evidence_class='allowlisted_source_projection', capture_budget=1, native_read_budget=12,
             expires_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat(), project_root=str(ROOT),
             nos_source_root=str(ROOT.parent / 'NOS-V1'),
             probe_sha256=sha256((ROOT / 'scripts/probe-linkedin-company.cjs').read_bytes()).hexdigest())
-        if resume is None: path.write_text(json.dumps(manifest), encoding='utf-8')
+        if resume is None and declared_path is None: path.write_text(json.dumps(manifest), encoding='utf-8')
         stream = 'linkedin-native-startup:' + experiment
         config = replace(load_app_config(NOS / 'M1'), data_dir=data, sqlite_path=data / 'worker.sqlite',
             raw_evidence_dir=data / 'raw', secret_dir=data / 'secrets', session_registry_path=None,
