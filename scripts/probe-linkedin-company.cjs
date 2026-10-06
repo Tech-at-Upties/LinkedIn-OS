@@ -11,7 +11,7 @@ const profile = path.join(root, '.local', 'linkedin-test-browser');
 const holdPath = path.join(root, '.local', 'linkedin-acquisition-hold.json');
 function parseProbeArgs(args) {
   const options = { observeContinuation: false, observeBoundary: false, runtimeCapture: false,
-    runtimeInitialPage: false, bootstrap: false, bootstrapStructure: false, bootstrapBody: false, bootstrapResolver: false, bootstrapDeadline: null, target: 'https://www.linkedin.com/company/linkedin/posts/' };
+    runtimeInitialPage: false, runtimeCompanyBatch: false, batchPageBudget: null, bootstrap: false, bootstrapStructure: false, bootstrapBody: false, bootstrapResolver: false, bootstrapDeadline: null, target: 'https://www.linkedin.com/company/linkedin/posts/' };
   let targetSeen = false;
   const seen = new Set();
   for (const argument of args) {
@@ -23,9 +23,11 @@ function parseProbeArgs(args) {
     if (seen.has(name)) throw new Error('Duplicate mode argument');
     seen.add(name);
     const flags = { '--continuation': 'observeContinuation', '--boundary': 'observeBoundary',
-      '--runtime-capture': 'runtimeCapture', '--runtime-initial-page': 'runtimeInitialPage', '--bootstrap': 'bootstrap', '--bootstrap-structure': 'bootstrapStructure', '--bootstrap-body': 'bootstrapBody', '--bootstrap-resolver': 'bootstrapResolver' };
+      '--runtime-capture': 'runtimeCapture', '--runtime-initial-page': 'runtimeInitialPage', '--runtime-company-batch': 'runtimeCompanyBatch', '--bootstrap': 'bootstrap', '--bootstrap-structure': 'bootstrapStructure', '--bootstrap-body': 'bootstrapBody', '--bootstrap-resolver': 'bootstrapResolver' };
     if (flags[argument]) options[flags[argument]] = true;
-    else if (name === '--bootstrap-deadline' && argument.includes('=')) {
+    else if (name === '--batch-page-budget' && /^--batch-page-budget=[23]$/.test(argument)) {
+      options.batchPageBudget = Number(argument.at(-1));
+    } else if (name === '--bootstrap-deadline' && argument.includes('=')) {
       const value = argument.slice(argument.indexOf('=') + 1);
       if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
           || !Number.isFinite(Date.parse(value))) throw new Error('Aware bootstrap deadline required');
@@ -36,18 +38,20 @@ function parseProbeArgs(args) {
     throw new Error('Choose one bootstrap representation mode');
   if (options.bootstrapStructure || options.bootstrapBody || options.bootstrapResolver) options.bootstrap = true;
   if (options.runtimeInitialPage && (!options.runtimeCapture || options.bootstrap)) throw new Error('Initial runtime mode requires exclusive runtime capture');
+  if (options.runtimeCompanyBatch && (!options.runtimeCapture || options.bootstrap || options.runtimeInitialPage)
+      || options.runtimeCompanyBatch !== (options.batchPageBudget !== null)) throw new Error('Batch runtime mode requires exclusive capture and page budget');
   if (options.observeContinuation && options.observeBoundary
       || (options.runtimeCapture || options.bootstrap) && (options.observeContinuation || options.observeBoundary))
     throw new Error('Incompatible acquisition modes');
-  if ((options.bootstrap || options.runtimeInitialPage) !== (options.bootstrapDeadline !== null)) throw new Error('Bounded document mode requires its deadline');
-  if ((options.bootstrap || options.runtimeInitialPage) && options.target !== 'https://www.linkedin.com/company/linkedin/posts/')
+  if ((options.bootstrap || options.runtimeInitialPage || options.runtimeCompanyBatch) !== (options.bootstrapDeadline !== null)) throw new Error('Bounded document mode requires its deadline');
+  if ((options.bootstrap || options.runtimeInitialPage || options.runtimeCompanyBatch) && options.target !== 'https://www.linkedin.com/company/linkedin/posts/')
     throw new Error('Bootstrap target differs from its declared scope');
   return options;
 }
 const options = require.main === module ? parseProbeArgs(process.argv.slice(2)) : parseProbeArgs([]);
-const { observeContinuation, observeBoundary, runtimeCapture, runtimeInitialPage, bootstrap, bootstrapStructure, bootstrapBody, bootstrapResolver, bootstrapDeadline } = options;
-const boundedDocumentMode = bootstrap || runtimeInitialPage;
-const bootstrapBodyMode = bootstrapBody || bootstrapResolver || runtimeInitialPage;
+const { observeContinuation, observeBoundary, runtimeCapture, runtimeInitialPage, runtimeCompanyBatch, batchPageBudget, bootstrap, bootstrapStructure, bootstrapBody, bootstrapResolver, bootstrapDeadline } = options;
+const boundedDocumentMode = bootstrap || runtimeInitialPage || runtimeCompanyBatch;
+const bootstrapBodyMode = bootstrapBody || bootstrapResolver || runtimeInitialPage || runtimeCompanyBatch;
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
 const resultPath = path.join(root, 'docs', 'results', `company-read-${runId}.json`);
 const sourceRoot = process.env.NOS_SOURCE_ROOT || path.resolve(root, '..', 'NOS-V1');
@@ -298,6 +302,43 @@ function initialPageProjection(html, navigation, onBody = () => {}) {
   return rows[0];
 }
 
+function batchRequestScope(url) {
+  if (url.origin !== 'https://www.linkedin.com' || url.pathname !== '/voyager/api/graphql'
+      || url.searchParams.getAll('queryId').length !== 1 || url.searchParams.getAll('variables').length !== 1
+      || !/^voyagerFeedDashOrganizationalPageUpdates\.[A-Za-z0-9_.-]+$/.test(url.searchParams.get('queryId') || ''))
+    throw new Error('Batch feed request differs');
+  const variables = url.searchParams.get('variables'), fields = {};
+  for (const key of ['organizationalPageUrn', 'start', 'count']) {
+    const matches = [...variables.matchAll(new RegExp('(?:^|[,(])' + key + '\\s*:\\s*([^,)]+)', 'g'))];
+    if (matches.length !== 1) throw new Error('Batch request field is ambiguous');
+    fields[key] = decodeURIComponent(matches[0][1]);
+  }
+  if (fields.organizationalPageUrn !== 'urn:li:fsd_organizationalPage:1337'
+      || !['3', '13'].includes(fields.start) || fields.count !== '10') throw new Error('Batch request scope differs');
+  return {start: Number(fields.start), count: 10};
+}
+
+function batchPages(receipt, budget) {
+  if (receipt.stopped || receipt.failure_kind) return [];
+  if (![2, 3].includes(budget) || !receipt.initial_page) throw new Error('Batch initial page absent');
+  const pages = [{page_mode: 'initial_document', start: 0, count: 3, record: receipt.initial_page}];
+  const feeds = receipt.responses.filter(record => (record.operation_id || '').startsWith('voyagerFeedDashOrganizationalPageUpdates.'));
+  if (feeds.length < 1 || feeds.length > budget - 1) throw new Error('Batch feed response count differs');
+  for (let index = 0; index < feeds.length; index++) {
+    const record = feeds[index], start = index === 0 ? 3 : 13, collection = record.representation?.collection_projection;
+    const request = record.request_parameters?.fields;
+    if (record.status !== 200 || !['GET', 'HEAD'].includes(record.method) || record.origin !== 'https://www.linkedin.com'
+        || record.pathname !== '/voyager/api/graphql' || !/json/i.test(record.content_type || '')
+        || request?.start !== start || request?.count !== 10
+        || request?.organizationalPageUrn?.value_sha256 !== sha('urn:li:fsd_organizationalPage:1337')
+        || collection?.status !== 'captured' || collection.fields.paging?.start !== start || collection.fields.paging?.count !== 10
+        || collection.fields['*elements'].length > 10 || record.representation.traversal_bounded
+        || record.representation.duplicate_entity_ids.length) throw new Error('Batch response scope unproved');
+    pages.push({page_mode: 'api_following', start, count: 10, record});
+  }
+  return pages;
+}
+
 async function main() {
   // The user authorized bounded read-only testing on 2026-10-03.
   // Scope, request limits and security holds are enforced independently of login.
@@ -309,8 +350,10 @@ async function main() {
     session_reported_by_user: true, session_verified: false, account_writes_blocked: true,
     responses: [], blocked_nonread_requests: 0, native_read_budget: 12, stopped: null };
   if (runtimeInitialPage) { receipt.page_mode = 'initial_document'; receipt.initial_page = null; }
+  if (runtimeCompanyBatch) { receipt.batch_kind = 'company-source-batch/1'; receipt.batch_page_budget = batchPageBudget; receipt.initial_page = null; }
   let context, stopped = null, nativeReads = 0, nativeCandidates = 0, scopedBlocked = 0, feedReads = 0;
   let firstFeedRequest = null;
+  let batchScrollArmed = false;
   let deadlineTimer = null, bootstrapBounded = false, bootstrapScopeMismatch = false;
   const bootstrapCandidates = [];
   const pending = [];
@@ -369,13 +412,20 @@ async function main() {
         const scoped = operation.startsWith('voyagerOrganizationDashCompanies.') ||
           operation.startsWith('voyagerFeedDashOrganizationalPageUpdates.');
         if (!scoped) { scopedBlocked++; return route.abort('blockedbyclient'); }
+        if (runtimeCompanyBatch && operation.startsWith('voyagerFeedDashOrganizationalPageUpdates.')) {
+          try {
+            const scope = batchRequestScope(url);
+            if (feedReads >= batchPageBudget - 1 || scope.start !== (feedReads === 0 ? 3 : 13)
+                || feedReads > 0 && !batchScrollArmed) return route.abort('blockedbyclient');
+          } catch { receipt.failure_kind = 'Error'; return route.abort('blockedbyclient'); }
+        }
         if (bootstrapBodyMode && bootstrapRequestMetadata(url.href).target_binding === 'mismatched') {
           receipt.failure_kind = 'Error'; bootstrapScopeMismatch = true;
           return route.abort('blockedbyclient');
         }
         if (nativeReads >= receipt.native_read_budget) return route.abort('blockedbyclient');
         if (operation.startsWith('voyagerFeedDashOrganizationalPageUpdates.') &&
-            feedReads++ >= 1 + Number(observeContinuation) + Number(observeBoundary))
+            feedReads++ >= (runtimeCompanyBatch ? batchPageBudget - 1 : 1 + Number(observeContinuation) + Number(observeBoundary)))
           return route.abort('blockedbyclient');
         nativeReads++;
       }
@@ -408,7 +458,7 @@ async function main() {
         try {
           const bytes = await response.body();
           record.body_sha256 = sha(bytes); record.body_bytes = bytes.length;
-          if (runtimeInitialPage && mainNavigation) {
+          if ((runtimeInitialPage || runtimeCompanyBatch) && mainNavigation) {
             if (receipt.initial_page) throw new Error('Multiple initial documents');
             receipt.initial_page = initialPageProjection(bytes.toString('utf8'), record, body => {
               const signal = semanticSignal(body);
@@ -496,6 +546,17 @@ async function main() {
     if (!stopped) {
       const warning = await page.evaluate(() => /verify your identity|security verification|account (?:has been )?restricted|temporarily restricted|unusual activity|captcha/i.test(document.body?.innerText || ''));
       if (warning) stop('possible_security_warning_text', landedUrl.pathname, true);
+    }
+    if (runtimeCompanyBatch && batchPageBudget === 3 && !stopped && !receipt.failure_kind) {
+      // A single ordinary scroll after proving the separately observed first pages.
+      batchPages(receipt, 2);
+      batchScrollArmed = true;
+      const continuation = page.waitForResponse(response => {
+        try { return batchRequestScope(new URL(response.url())).start === 13; } catch { return false; }
+      }, {timeout: 12000}).then(() => true).catch(() => false);
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      receipt.continuation_response_observed = await continuation;
+      await page.waitForTimeout(1000);
     }
     if (observeContinuation && !stopped) {
       const continuation = page.waitForResponse(response =>
@@ -593,6 +654,16 @@ async function main() {
       receipt.session_verified = false;
       receipt.failure_kind = receipt.failure_kind || 'Error';
     }
+    if (runtimeCompanyBatch) {
+      try {
+        receipt.batch_pages = batchPages(receipt, batchPageBudget);
+        receipt.batch_shortfall_reason = receipt.batch_pages.length === 2 && batchPageBudget === 3 ? 'continuation_not_observed' : null;
+      } catch { receipt.batch_pages = []; receipt.failure_kind = receipt.failure_kind || 'Error'; }
+      // Release publication projections only through the distinct batch page list.
+      receipt.initial_page = null;
+      receipt.responses = receipt.responses.filter(record => !(record.operation_id || '').startsWith('voyagerFeedDashOrganizationalPageUpdates.'));
+      if (receipt.stopped || receipt.failure_kind) { receipt.batch_pages = []; receipt.responses = []; receipt.session_verified = false; }
+    }
     if (bootstrap) {
       console.log(JSON.stringify(bootstrapReceipt(receipt,
         summarizeBootstrapObservations(bootstrapCandidates, bootstrapBounded))));
@@ -624,7 +695,7 @@ function bootstrapReceipt(receipt, observation) {
     navigation_status: receipt.navigation_status ?? null, account_writes_blocked: true,
     bootstrap_observation: observation };
 }
-module.exports = { projection, describe, requestParameters, collectionProjection, semanticSignal, parseProbeArgs, bootstrapReceipt, isExactBootstrapNavigation, initialPageProjection };
+module.exports = { projection, describe, requestParameters, collectionProjection, semanticSignal, parseProbeArgs, bootstrapReceipt, isExactBootstrapNavigation, initialPageProjection, batchRequestScope, batchPages };
 if (require.main === module) main().catch(error => {
   console.error(JSON.stringify({ failure_kind: error.name || 'Error' })); process.exitCode = 1;
 });

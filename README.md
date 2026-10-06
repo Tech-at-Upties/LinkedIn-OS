@@ -22,6 +22,33 @@ Overfull pages also pause progress without claiming completeness. Actor fields r
 
 `Journal.purge_expired` removes expired retained bytes independently of result requests while preserving unresolved classification barriers. The NOS branch has a controlled source-specific generic job runtime with actual PostgreSQL ownership, Redis delivery, authenticated northbound results and local M2 HTTP admission. Generic task storage holds coverage/expiry metadata without duplicating source text; results are rebuilt only from eligible acknowledged bytes. See NOS `M1/docs/LINKEDIN_CONTROLLED_RUNTIME.md` for explicit saved-projection setup. Saved mode makes no LinkedIn requests. Separately declared live startup and remote source/task fencing have controlled verification; sustained operation and enabled derived processing remain open.
 
+## Company publication jobs
+
+The NOS branch accepts `LINKEDIN_COMPANY_FEED` through authenticated `POST /v1/jobs`. Supplying `requested_count` selects the count contract, version 2. Omitting it preserves the existing version-1 single-page job. The API chooses this version from the payload; callers constructing `CapabilityRequest` directly must supply the matching contract version.
+
+```json
+{
+  "capability_id": "LINKEDIN_COMPANY_FEED",
+  "idempotency_key": "company-publications-15",
+  "payload": {
+    "company_url": "https://www.linkedin.com/company/linkedin/posts/",
+    "feed_publisher_id": "urn:li:fsd_company:1337",
+    "page_mode": "initial_document",
+    "requested_count": 15,
+    "max_pages": 3,
+    "ordering": "relevance"
+  }
+}
+```
+
+`requested_count` targets unique occurrence IDs returned to the caller. It is separate from `max_pages`, source page sizes and the native read cap. The implemented batch path preserves initial start 0/count 3, API start 3/count 10, and optional continuation start 13/count 10 as separate source pages. It selects at most the requested count before M2 admission and preserves the same ordered IDs through delivery-only replay. Saved fixtures verify count and recovery behavior; native execution of this batch path is still pending.
+
+The initial route currently supports this fixed LinkedIn company URL and its independently observed feed ID. A URL alone does not resolve the publisher ID, and arbitrary company URLs are not established by this example. Keyword search, member-account feeds, particular-post lookup, recent ordering and date filters are not enabled. Current ordering is relevance.
+
+For an installed version-3 observation grant, `XINGESTION_LINKEDIN_GRANT_PATH` selects one bounded browser batch of two or three pages within the grant's page cap. Configure exactly one of grant, saved replay or legacy live mode. The worker consumes one capture grant, persists all returned projected pages before delivery, and classifies every saved member before the first M2 admission. A missing continuation becomes a shortfall, never another browser launch. Grant installation is operator configuration; ordinary jobs neither issue grants nor replenish capture allowances. See the [NOS controlled runtime guide](https://github.com/Tech-at-Upties/NOS-V1/blob/feat/linkedin-m1/M1/docs/LINKEDIN_CONTROLLED_RUNTIME.md).
+
+Fetch the job's returned `result_url` while its acknowledged source bodies remain eligible. Result `coverage` contains `requested_count`, `returned_count`, `fulfilled` and `shortfall_reason`. A succeeded bounded job can return fewer items with `fulfilled: false`; `source_complete` remains null even when the count is fulfilled. Empty/short pages, structural parse gaps, budget exhaustion and missing continuation remain distinct. Expiry or a source hold suppresses retained results rather than triggering another scrape.
+
 ## Install and test
 
 Use Python 3.11 or later. Verification was run locally on Python 3.12.
@@ -34,6 +61,13 @@ python -m venv .venv
 ```
 
 Synthetic tests verify parser, field-state, failure and durability behavior. A private projected-receipt check skips when its local artifact is absent. Synthetic/projected checks do not prove live source semantics.
+
+With the NOS integration checkout available, these focused checks use synthetic pages and isolated local stores:
+
+```powershell
+./.venv/Scripts/python.exe -m pytest tests/test_company_collection.py tests/test_company_batch.py tests/test_company_count_runtime.py tests/test_company_batch_runtime.py tests/test_company_batch_transport.py -q
+node --test tests/test_company_batch_probe.cjs
+```
 
 For controlled NOS integration, check out its `feat/linkedin-m1` branch separately and set `NOS_INTEGRATION_ROOT` to that checkout before running tests. Install this package in the same verification environment. Tests exercise actual M1 serialization, generic task ownership, northbound/local M2 HTTP and M2 service/storage. LinkedIn runtime remains disabled until explicitly configured; Redis delivery is tested separately.
 

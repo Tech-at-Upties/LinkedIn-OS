@@ -43,6 +43,27 @@ class SourceResponse:
 
 
 @dataclass(frozen=True)
+class BatchPageSpec:
+    attempt_id: str
+    ordinal: int
+    start: int
+    count: int
+    page_mode: str
+
+
+@dataclass(frozen=True)
+class BatchPageResponse:
+    spec: BatchPageSpec
+    response: SourceResponse
+
+
+@dataclass(frozen=True)
+class SourceBatchResponse:
+    pages: tuple[BatchPageResponse, ...]
+    shortfall_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class AcquisitionResult:
     attempt_id: str
     outcome: str
@@ -86,6 +107,15 @@ class Journal:
                   attempt_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
                   body_sha256 TEXT NOT NULL, eligibility_checked_at REAL NOT NULL,
                   outcome TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS response_batches (
+                  parent_attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE,
+                  declared_page_budget INTEGER NOT NULL, available_page_count INTEGER,
+                  shortfall_reason TEXT, state TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS response_batch_pages (
+                  parent_attempt_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                  attempt_id TEXT NOT NULL UNIQUE, start INTEGER NOT NULL,
+                  count INTEGER NOT NULL, page_mode TEXT NOT NULL,
+                  PRIMARY KEY (parent_attempt_id, ordinal));
             """)
 
     @contextmanager
@@ -148,6 +178,72 @@ class Journal:
         if pending:
             raise AcquisitionFailure("classification_pending")
 
+    def batch_for_attempt(self, attempt_id: str) -> dict | None:
+        """Read-only reservation/member metadata, never a second body copy."""
+        with self.connect() as connection:
+            return self._batch_for_attempt(connection, attempt_id)
+
+    @staticmethod
+    def _batch_for_attempt(connection, attempt_id):
+        row = connection.execute('''SELECT b.* FROM response_batches b JOIN response_batch_pages p
+            ON p.parent_attempt_id=b.parent_attempt_id WHERE p.attempt_id=?''', (attempt_id,)).fetchone()
+        if row is None:
+            return None
+        pages = connection.execute('SELECT * FROM response_batch_pages WHERE parent_attempt_id=? ORDER BY ordinal',
+                                   (row['parent_attempt_id'],)).fetchall()
+        result = dict(row)
+        if row['available_page_count'] is not None:
+            pages = pages[:row['available_page_count']]
+        result['pages'] = tuple(BatchPageSpec(p['attempt_id'], p['ordinal'], p['start'], p['count'], p['page_mode']) for p in pages)
+        return result
+
+    @staticmethod
+    def _validated_response(response):
+        if not isinstance(response, SourceResponse) or not isinstance(response.body, bytes) or len(response.body) > 8_000_000:
+            raise AcquisitionFailure('invalid_or_oversize_response')
+        captured = _time(response.captured_at)
+        if type(response.status) is not int or not (100 <= response.status <= 599 or response.status == 999):
+            raise AcquisitionFailure('invalid_response_status')
+        if not isinstance(response.content_type, str) or len(response.content_type) > 200:
+            raise AcquisitionFailure('invalid_content_type')
+        return captured
+
+    def _store_batch(self, connection, response, *, attempt_id, scope, generation, feed_publisher_id, permission):
+        batch = self._batch_for_attempt(connection, attempt_id)
+        if (batch is None or batch['parent_attempt_id'] != attempt_id or batch['state'] != 'reserved'
+                or not isinstance(response.pages, tuple) or len(response.pages) not in {2, 3}
+                or len(response.pages) > batch['declared_page_budget']):
+            raise AcquisitionFailure('invalid_batch_response')
+        expected_reason = 'continuation_not_observed' if len(response.pages) < batch['declared_page_budget'] else None
+        if response.shortfall_reason != expected_reason:
+            raise AcquisitionFailure('invalid_batch_shortfall')
+        captured_times = []
+        for expected, page in zip(batch['pages'], response.pages):
+            if not isinstance(page, BatchPageResponse) or page.spec != expected:
+                raise AcquisitionFailure('batch_member_context_conflict')
+            captured = self._validated_response(page.response)
+            if captured >= _time(permission.raw_expires_at):
+                raise AcquisitionFailure('batch_capture_after_expiry')
+            if expected.ordinal and connection.execute('SELECT 1 FROM responses WHERE attempt_id=?', (expected.attempt_id,)).fetchone():
+                raise AcquisitionFailure('batch_member_already_captured')
+            captured_times.append(captured)
+        if captured_times != sorted(captured_times):
+            raise AcquisitionFailure('batch_capture_time_order')
+        # All member validation precedes the first write. The caller owns the
+        # physical transaction, so no partial batch can survive a write error.
+        for page, captured in zip(response.pages, captured_times):
+            value = page.response
+            if page.spec.ordinal:
+                connection.execute("INSERT INTO responses VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured')",
+                    (page.spec.attempt_id, scope, generation, value.status, value.content_type, captured,
+                     permission.evidence_class, hashlib.sha256(value.body).hexdigest(), _time(permission.raw_expires_at), value.body))
+                connection.execute('INSERT INTO attempt_context VALUES (?, ?)', (page.spec.attempt_id, feed_publisher_id))
+            else:
+                connection.execute("UPDATE responses SET status=?, content_type=?, captured_at=?, body_sha256=?, body=?, outcome='captured' WHERE attempt_id=?",
+                    (value.status, value.content_type, captured, hashlib.sha256(value.body).hexdigest(), value.body, attempt_id))
+        connection.execute("UPDATE response_batches SET available_page_count=?, shortfall_reason=?, state='captured' WHERE parent_attempt_id=?",
+                           (len(response.pages), response.shortfall_reason, attempt_id))
+
     def capture(self, *, scope: str, generation: int, attempt_id: str,
                 feed_publisher_id: str, permission: RoutePermission,
                 now: datetime, send: Callable[[], SourceResponse] | None = None,
@@ -196,6 +292,9 @@ class Journal:
                         or existing["evidence_class"] != permission.evidence_class):
                     raise AcquisitionFailure("attempt_identity_conflict")
                 return True
+            batch = self._batch_for_attempt(connection, attempt_id)
+            if batch is not None and batch['parent_attempt_id'] != attempt_id:
+                raise AcquisitionFailure('batch_member_unavailable')
             self._require_classified(connection, scope)
             connection.execute("INSERT INTO responses VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, NULL, 'dispatch_unknown')", (
                 attempt_id, scope, generation, permission.evidence_class, expires,
@@ -220,13 +319,13 @@ class Journal:
                 connection.execute("UPDATE responses SET outcome='transport_failure' WHERE attempt_id=?", (attempt_id,))
                 return False
             try:
-                if not isinstance(response, SourceResponse) or not isinstance(response.body, bytes) or len(response.body) > 8_000_000:
-                    raise AcquisitionFailure("invalid_or_oversize_response")
-                captured = _time(response.captured_at)
-                if type(response.status) is not int or not (100 <= response.status <= 599 or response.status == 999):
-                    raise AcquisitionFailure("invalid_response_status")
-                if not isinstance(response.content_type, str) or len(response.content_type) > 200:
-                    raise AcquisitionFailure("invalid_content_type")
+                if isinstance(response, SourceBatchResponse):
+                    self._store_batch(connection, response, attempt_id=attempt_id, scope=scope,
+                        generation=generation, feed_publisher_id=feed_publisher_id, permission=permission)
+                    return False
+                if self._batch_for_attempt(connection, attempt_id) is not None:
+                    raise AcquisitionFailure('batch_response_required')
+                captured = self._validated_response(response)
             except AcquisitionFailure:
                 connection.execute("UPDATE responses SET outcome='invalid_response' WHERE attempt_id=?", (attempt_id,))
                 return False
@@ -339,6 +438,57 @@ def acquire_company_page(*, journal: Journal, scope: str, generation: int,
     else:
         outcome = journal.finish(scope, generation, attempt_id, outcome)
     return AcquisitionResult(attempt_id, outcome, record["body_sha256"], None, replayed)
+
+
+def classify_company_batch(*, journal: Journal, parent_attempt_id: str, permission: RoutePermission,
+                           now: datetime, operation_guard: Callable[[], object] | None = None) -> tuple[AcquisitionResult, ...]:
+    """Classify every saved member before first delivery, with zero dispatch.
+
+    Existing capture replay bypasses the classification barrier without
+    weakening it. Any member's security signal holds the whole source.
+    """
+    batch = journal.batch_for_attempt(parent_attempt_id)
+    if batch is None or batch['parent_attempt_id'] != parent_attempt_id or batch['state'] != 'captured':
+        raise AcquisitionFailure('batch_not_captured')
+    with journal.connect() as connection:
+        parent = connection.execute('SELECT generation FROM responses WHERE attempt_id=?', (parent_attempt_id,)).fetchone()
+        context = connection.execute('SELECT feed_publisher_id FROM attempt_context WHERE attempt_id=?', (parent_attempt_id,)).fetchone()
+    if parent is None or context is None:
+        raise AcquisitionFailure('batch_parent_context_missing')
+
+    def no_dispatch():
+        raise AcquisitionFailure('batch_replay_must_not_dispatch')
+
+    results, failed = [], False
+    for spec in batch['pages']:
+        record = journal.read(spec.attempt_id, now)
+        if (record is None or record['body'] is None or record['generation'] != parent['generation']
+                or record['evidence_class'] != permission.evidence_class
+                or record['outcome'] not in {'captured', 'bounded', 'partial'}
+                or hashlib.sha256(record['body']).hexdigest() != record['body_sha256']):
+            failed = True
+            continue
+        try:
+            result = acquire_company_page(journal=journal, scope='linkedin.company-feed', generation=parent['generation'],
+                permission=permission, feed_publisher_id=context['feed_publisher_id'], attempt_id=spec.attempt_id,
+                now=now, send=no_dispatch, operation_guard=operation_guard,
+                page_validator=lambda page, selected=spec: _validate_batch_page(selected, page))
+        except AcquisitionFailure:
+            failed = True
+            continue
+        results.append(result)
+        if result.outcome not in {'bounded', 'partial'}:
+            failed = True
+            if result.outcome in {'restricted', 'authentication_required', 'challenge', 'quarantined_after_stop'}:
+                break
+    if failed:
+        raise AcquisitionFailure('batch_member_not_eligible')
+    return tuple(results)
+
+
+def _validate_batch_page(spec: BatchPageSpec, page: ParsedPage):
+    if page.paging.get('start') != spec.start or page.paging.get('count') != spec.count:
+        raise ParseFailure('batch_page_paging_conflict')
 
 
 def _semantic_stop(body) -> str | None:

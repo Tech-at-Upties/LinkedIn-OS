@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import uuid4
 
-from .acquisition import Journal
+from .acquisition import BatchPageSpec, Journal
 from .models import ParsedPage
 from .parser import EVIDENCE_CLASSES, ParseFailure, native_id, parse_company_feed
 
@@ -172,6 +172,32 @@ class CompanyPageRuns:
         with self.journal.connect() as connection:
             self._owned(connection, lease, _time(now))
 
+    def reserve_batch(self, lease: PageLease, *, batch_page_budget: int, now: datetime) -> tuple[BatchPageSpec, ...]:
+        """Reserve exact receipt identities once, without admitting child reads."""
+        if type(batch_page_budget) is not int or batch_page_budget not in {2, 3}:
+            raise PageRunFailure('invalid_batch_budget')
+        with self.journal.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            run = self._owned(connection, lease, _time(now))
+            if (lease.ordinal != 0 or lease.start != 0 or lease.count != 3
+                    or run['following_count'] != 10 or run['collection_target'] is None
+                    or run['page_budget'] != batch_page_budget):
+                raise PageRunFailure('invalid_batch_run')
+            previous = connection.execute('SELECT * FROM response_batches WHERE run_id=?', (lease.run_id,)).fetchone()
+            if previous is not None:
+                if previous['parent_attempt_id'] != lease.attempt_id or previous['declared_page_budget'] != batch_page_budget:
+                    raise PageRunFailure('batch_reservation_conflict')
+            else:
+                connection.execute("INSERT INTO response_batches VALUES (?, ?, ?, NULL, NULL, 'reserved')",
+                                   (lease.attempt_id, lease.run_id, batch_page_budget))
+                for ordinal, (start, count, mode) in enumerate(((0, 3, 'initial_document'), (3, 10, 'api_following'), (13, 10, 'api_following'))[:batch_page_budget]):
+                    attempt_id = lease.attempt_id if ordinal == 0 else f'li-page-{uuid4().hex}'
+                    connection.execute('INSERT OR IGNORE INTO company_pages (run_id, ordinal, attempt_id, start) VALUES (?, ?, ?, ?)',
+                                       (lease.run_id, ordinal, attempt_id, start))
+                    connection.execute('INSERT INTO response_batch_pages VALUES (?, ?, ?, ?, ?, ?)',
+                                       (lease.attempt_id, ordinal, attempt_id, start, count, mode))
+        return self.journal.batch_for_attempt(lease.attempt_id)['pages']
+
     @staticmethod
     def validate_page(lease: PageLease, page: ParsedPage):
         if (page.paging.get('start') != lease.start or page.paging.get('count') != lease.count
@@ -298,6 +324,9 @@ class CompanyPageRuns:
                 state = 'short_page'
             elif len(page.publications) > lease.count:
                 state = 'overfull_page'
+            elif (batch := connection.execute('SELECT * FROM response_batches WHERE run_id=?', (lease.run_id,)).fetchone()) is not None and (
+                    batch['available_page_count'] is None or run['completed_pages'] + 1 >= batch['available_page_count']):
+                state = batch['shortfall_reason'] or 'budget_exhausted'
             elif run['completed_pages'] + 1 >= run['page_budget']:
                 state = 'budget_exhausted'
             elif next_start >= page.paging['total']:
