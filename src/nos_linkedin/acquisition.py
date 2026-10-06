@@ -150,8 +150,19 @@ class Journal:
 
     def capture(self, *, scope: str, generation: int, attempt_id: str,
                 feed_publisher_id: str, permission: RoutePermission,
-                now: datetime, send: Callable[[], SourceResponse],
+                now: datetime, send: Callable[[], SourceResponse] | None = None,
+                send_guarded: Callable[[sqlite3.Connection], SourceResponse] | None = None,
                 operation_guard: Callable[[], object] | None = None):
+        """Dispatch once, optionally lending the physical source transaction.
+
+        A guarded transport borrows the live writer connection after all
+        dispatch guards. It must not begin, commit, roll back or close it.
+        This is a trusted callback contract, not an OS security boundary.
+        """
+        if ((send is None) == (send_guarded is None)
+                or send is not None and not callable(send)
+                or send_guarded is not None and not callable(send_guarded)):
+            raise AcquisitionFailure("invalid_transport_callback")
         _scope(scope)
         if type(generation) is not int or generation < 0:
             raise AcquisitionFailure("invalid_generation")
@@ -202,7 +213,7 @@ class Journal:
             if operation_guard is not None:
                 operation_guard()
             try:
-                response = send()
+                response = send_guarded(connection) if send_guarded is not None else send()
             except Exception:
                 # Persist that this attempt actually dispatched. Reusing the
                 # same attempt must never silently send again after a timeout.
@@ -277,14 +288,15 @@ class Journal:
 
 def acquire_company_page(*, journal: Journal, scope: str, generation: int,
                          permission: RoutePermission, feed_publisher_id: str,
-                         send: Callable[[], SourceResponse], now: datetime,
+                         now: datetime, send: Callable[[], SourceResponse] | None = None,
+                         send_guarded: Callable[[sqlite3.Connection], SourceResponse] | None = None,
                          attempt_id: str | None = None,
                          operation_guard: Callable[[], object] | None = None,
                          page_validator: Callable[[ParsedPage], object] | None = None) -> AcquisitionResult:
     attempt_id = attempt_id or uuid4().hex
     replayed = journal.capture(scope=scope, generation=generation, attempt_id=attempt_id,
                                feed_publisher_id=feed_publisher_id, permission=permission, now=now, send=send,
-                               operation_guard=operation_guard)
+                               send_guarded=send_guarded, operation_guard=operation_guard)
     record = journal.read(attempt_id, now)
     if record["outcome"] in {"dispatch_unknown", "transport_failure", "invalid_response"}:
         return AcquisitionResult(attempt_id, record["outcome"], None, None, replayed)

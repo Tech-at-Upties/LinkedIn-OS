@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from uuid import uuid4
 
 from .acquisition import Journal
@@ -13,6 +14,10 @@ from .parser import EVIDENCE_CLASSES, ParseFailure, native_id, parse_company_fee
 
 SCOPE = 'linkedin.company-feed'
 _LABEL = re.compile(r'[A-Za-z0-9_-]{1,120}\Z')
+_COLLECTION_FIELD_WARNINGS = frozenset({
+    'preceding_items_not_in_this_page', 'unknown_actor', 'missing_social_detail',
+    'invalid_metric', 'invalid_reaction_type', 'invalid_reaction_types', 'unresolved_reshare',
+})
 
 
 class PageRunFailure(RuntimeError):
@@ -69,7 +74,16 @@ class CompanyPageRuns:
                   completed INTEGER NOT NULL DEFAULT 0, observed_total INTEGER,
                   publication_count INTEGER, body_sha256 TEXT,
                   PRIMARY KEY (run_id, ordinal));
+                CREATE TABLE IF NOT EXISTS company_page_selection (
+                  run_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                  body_sha256 TEXT NOT NULL, item_ids TEXT NOT NULL,
+                  PRIMARY KEY (run_id, ordinal));
             ''')
+            connection.execute('BEGIN IMMEDIATE')
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(company_runs)')}
+            for name in ('collection_target', 'following_count'):
+                if name not in columns:
+                    connection.execute(f'ALTER TABLE company_runs ADD COLUMN {name} INTEGER')
 
     @staticmethod
     def _source(connection, generation):
@@ -85,8 +99,9 @@ class CompanyPageRuns:
 
     @staticmethod
     def _ticket(row):
+        count = row['following_count'] if row['ordinal'] > 0 and row['following_count'] is not None else row['requested_count']
         return PageLease(row['run_id'], row['attempt_id'], row['ordinal'], row['start'],
-                         row['requested_count'], row['feed_publisher_id'], row['evidence_class'],
+                         count, row['feed_publisher_id'], row['evidence_class'],
                          row['generation'], row['owner'], row['lease_token'],
                          datetime.fromtimestamp(row['lease_until'], UTC))
 
@@ -100,7 +115,8 @@ class CompanyPageRuns:
         return row
 
     def create(self, *, run_id: str, feed_publisher_id: str, evidence_class: str,
-               first_start: int, count: int, page_budget: int):
+               first_start: int, count: int, page_budget: int,
+               requested_count: int | None = None, following_count: int | None = None):
         _label(run_id)
         if not native_id(feed_publisher_id) or evidence_class not in EVIDENCE_CLASSES:
             raise PageRunFailure('invalid_run_context')
@@ -108,19 +124,28 @@ class CompanyPageRuns:
                 or type(count) is not int or not 1 <= count <= 100
                 or type(page_budget) is not int or not 1 <= page_budget <= 100):
             raise PageRunFailure('invalid_run_bounds')
+        if ((requested_count is not None and (type(requested_count) is not int or not 1 <= requested_count <= 10_000))
+                or (following_count is not None and (type(following_count) is not int or not 1 <= following_count <= 100))
+                or (following_count is not None and requested_count is None)):
+            raise PageRunFailure('invalid_collection_bounds')
         generation = self.journal.generation(SCOPE)
-        context = (feed_publisher_id, evidence_class, generation, first_start, count, page_budget)
+        context = (feed_publisher_id, evidence_class, generation, first_start, count, page_budget,
+                   requested_count, following_count)
         with self.journal.connect() as connection:
             connection.execute('BEGIN IMMEDIATE')
             self._source(connection, generation)
             previous = connection.execute('SELECT * FROM company_runs WHERE run_id=?', (run_id,)).fetchone()
             if previous:
                 if tuple(previous[key] for key in ('feed_publisher_id', 'evidence_class', 'generation',
-                                                  'first_start', 'requested_count', 'page_budget')) != context:
+                                                  'first_start', 'requested_count', 'page_budget',
+                                                  'collection_target', 'following_count')) != context:
                     raise PageRunFailure('run_context_conflict')
                 return
-            connection.execute('INSERT INTO company_runs VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, NULL)',
-                               (run_id, *context, first_start, 'active'))
+            connection.execute('''INSERT INTO company_runs
+                (run_id, feed_publisher_id, evidence_class, generation, first_start, requested_count,
+                 page_budget, completed_pages, next_start, state, collection_target, following_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?)''',
+                               (run_id, *context[:6], first_start, *context[6:]))
 
     def claim(self, run_id: str, *, owner: str, now: datetime, lease_seconds: int = 60) -> PageLease | None:
         _label(run_id)
@@ -154,6 +179,84 @@ class CompanyPageRuns:
                        or item.evidence_class != lease.evidence_class for item in page.publications)):
             raise ParseFailure('page_request_mismatch')
 
+    @staticmethod
+    def _acknowledged_ids(connection, run_id):
+        rows = connection.execute('''SELECT s.item_ids FROM company_page_selection s
+            JOIN company_pages p ON p.run_id=s.run_id AND p.ordinal=s.ordinal
+            WHERE s.run_id=? AND p.completed=1 ORDER BY s.ordinal''', (run_id,)).fetchall()
+        return tuple(item_id for row in rows for item_id in json.loads(row['item_ids']))
+
+    def acknowledged_ids(self, run_id: str) -> tuple[str, ...]:
+        """Metadata only. Retained body eligibility still gates result reconstruction."""
+        with self.journal.connect() as connection:
+            return self._acknowledged_ids(connection, run_id)
+
+    def prepare_selection(self, lease: PageLease, page: ParsedPage, now: datetime) -> tuple[str, ...]:
+        """Commit the exact result subset before delivery, outside its writer lock.
+
+        Occurrence IDs match northbound item_id. A pending page reserves its
+        subset across an ambiguous sink commit and subsequent owner takeover.
+        """
+        timestamp = _time(now)
+        with self.journal.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            run = self._owned(connection, lease, timestamp)
+            if run['collection_target'] is None:
+                raise PageRunFailure('collection_target_required')
+            record = connection.execute('SELECT * FROM responses WHERE attempt_id=?', (lease.attempt_id,)).fetchone()
+            context = connection.execute('SELECT feed_publisher_id FROM attempt_context WHERE attempt_id=?',
+                                         (lease.attempt_id,)).fetchone()
+            if (record is None or record['scope'] != SCOPE or record['generation'] != lease.generation
+                    or record['evidence_class'] != lease.evidence_class
+                    or record['outcome'] not in {'captured', 'bounded', 'partial'}
+                    or not 200 <= record['status'] < 300 or 'json' not in record['content_type'].lower()
+                    or context is None or context[0] != lease.feed_publisher_id):
+                raise PageRunFailure('selection_context_conflict')
+            if record['body'] is None or record['expires_at'] <= timestamp:
+                raise PageRunFailure('page_retention_expired')
+            if sha256(record['body']).hexdigest() != record['body_sha256']:
+                raise PageRunFailure('selection_digest_conflict')
+            retained = parse_company_feed(json.loads(record['body']), feed_publisher_id=lease.feed_publisher_id,
+                observed_at=datetime.fromtimestamp(record['captured_at'], UTC), evidence_class=lease.evidence_class)
+            self.validate_page(lease, retained)
+            if page != retained:
+                raise PageRunFailure('selection_page_conflict')
+            previous = connection.execute('SELECT * FROM company_page_selection WHERE run_id=? AND ordinal=?',
+                                          (lease.run_id, lease.ordinal)).fetchone()
+            seen = set(self._acknowledged_ids(connection, lease.run_id))
+            remaining = max(0, run['collection_target'] - len(seen))
+            selected = []
+            occurrences = {}
+            for item in page.publications:
+                original = occurrences.setdefault(item.occurrence_id, item)
+                if replace(item, representation_id=original.representation_id) != original:
+                    raise ParseFailure('ambiguous_occurrence_identity')
+                if item.occurrence_id not in seen:
+                    seen.add(item.occurrence_id)
+                    if len(selected) < remaining:
+                        selected.append(item.occurrence_id)
+            if previous is not None:
+                if (previous['body_sha256'] != record['body_sha256']
+                        or json.loads(previous['item_ids']) != selected):
+                    raise PageRunFailure('selection_replay_conflict')
+            else:
+                connection.execute('INSERT INTO company_page_selection VALUES (?, ?, ?, ?)',
+                    (lease.run_id, lease.ordinal, record['body_sha256'], json.dumps(selected)))
+            return tuple(selected)
+
+    def selected_ids(self, lease: PageLease) -> tuple[str, ...]:
+        """Read only, including when called under Journal.deliver's writer lock."""
+        with self.journal.connect() as connection:
+            selected = connection.execute('''SELECT s.item_ids, s.body_sha256, r.body_sha256 AS retained_digest
+                FROM company_page_selection s JOIN company_pages p
+                ON p.run_id=s.run_id AND p.ordinal=s.ordinal
+                JOIN responses r ON r.attempt_id=p.attempt_id
+                WHERE s.run_id=? AND s.ordinal=? AND p.attempt_id=?''',
+                (lease.run_id, lease.ordinal, lease.attempt_id)).fetchone()
+            if selected is None or selected['body_sha256'] != selected['retained_digest']:
+                raise PageRunFailure('selection_missing_or_conflicting')
+            return tuple(json.loads(selected['item_ids']))
+
     def checkpoint(self, lease: PageLease, now: datetime) -> dict:
         timestamp = _time(now)
         with self.journal.connect() as connection:
@@ -177,7 +280,17 @@ class CompanyPageRuns:
                                       evidence_class=lease.evidence_class)
             self.validate_page(lease, page)
             next_start = lease.start + lease.count
-            if any(issue.code != 'preceding_items_not_in_this_page' for issue in page.issues):
+            selected_count = 0
+            if run['collection_target'] is not None:
+                selection = connection.execute('SELECT * FROM company_page_selection WHERE run_id=? AND ordinal=?',
+                                               (lease.run_id, lease.ordinal)).fetchone()
+                if selection is None or selection['body_sha256'] != record['body_sha256']:
+                    raise PageRunFailure('selection_missing_or_conflicting')
+                selected_count = len(self._acknowledged_ids(connection, lease.run_id)) + len(json.loads(selection['item_ids']))
+            if run['collection_target'] is not None and selected_count >= run['collection_target']:
+                state = 'fulfilled'
+            elif any(issue.code not in (_COLLECTION_FIELD_WARNINGS if run['collection_target'] is not None
+                                       else {'preceding_items_not_in_this_page'}) for issue in page.issues):
                 state = 'partial_graph'
             elif not page.publications:
                 state = 'empty_page'
@@ -213,7 +326,13 @@ class CompanyPageRuns:
             row = connection.execute('SELECT * FROM company_runs WHERE run_id=?', (run_id,)).fetchone()
             if row is None:
                 raise PageRunFailure('unknown_run')
-            return {'run_id': run_id, 'state': row['state'], 'completed_pages': row['completed_pages'],
+            result = {'run_id': run_id, 'state': row['state'], 'completed_pages': row['completed_pages'],
                     'page_budget': row['page_budget'], 'next_start_candidate': row['next_start'],
                     'source_complete': None, 'ordering': 'relevance',
                     'preceding_items_missing': row['first_start'] > 0}
+            if row['collection_target'] is not None:
+                returned = len(self._acknowledged_ids(connection, run_id))
+                fulfilled = returned >= row['collection_target']
+                result.update(requested_count=row['collection_target'], returned_count=returned,
+                    fulfilled=fulfilled, shortfall_reason=None if fulfilled or row['state'] == 'active' else row['state'])
+            return result
